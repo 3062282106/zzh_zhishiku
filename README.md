@@ -273,3 +273,39 @@ sudo bash scripts/configure-mcp-entry.sh 47.120.35.20 any
 来源限制建议直接写 `any`。同一个办公室实测就有两个出口 IP——SSH 走一个、浏览器走另一个——逐个收集只会变成打地鼠。真正拦住陌生人的是令牌（32 字节随机串，只在建成员时返回一次），nginx 那边按 IP 限速（每分钟 120 次，突发 30）挡住无差别扫描。确实要收紧就重跑脚本列出 IP，并在安全组里把授权对象改成同样的地址。
 
 代价是明文 HTTP：令牌和检索结果在公网上不加密，端口对全网可见（没令牌一律 401）。日志里会有扫描噪音。以后买了域名，把这段换成 443 加证书即可，同事只改一个 URL，成员和授权都不用动。
+
+### 用 Cloudflare 隧道换成 HTTPS（不用备案）
+
+IP + 非标端口能用，但明文传输，而且同事换个网络就得改白名单。把域名托管到 Cloudflare、让服务器主动往外连，这两件事一起解决：不开任何入站端口，不需要备案，令牌走加密通道。
+
+前提是域名已经在 Cloudflare 托管（`nslookup -type=NS <域名>` 能看到 `*.ns.cloudflare.com` 就对了；不在的话先改 nameserver）。
+
+```bash
+cloudflared tunnel login                 # 打印一个链接，浏览器授权一次
+cloudflared tunnel create knowledge-kb   # 记下输出的 UUID
+cloudflared tunnel route dns knowledge-kb kb.example.com
+```
+
+`/etc/cloudflared/config.yml`：
+
+```yaml
+tunnel: <UUID>
+credentials-file: /root/.cloudflared/<UUID>.json
+ingress:
+  - hostname: kb.example.com
+    service: http://127.0.0.1:18443
+  - service: http_status:404
+```
+
+隧道落在 nginx 的 18443 上而不是直连 18082，这样限流、路径白名单、`/healthz` 在两条入口上行为一致。
+
+```bash
+cloudflared service install
+systemctl enable --now cloudflared
+```
+
+最后把 `api.env` 的 `KB_MCP_PUBLIC_URL` 改成 `https://kb.example.com/mcp` 并重启 API，控制台的接入说明会自动跟着变。
+
+**实测延迟**：免费版国内没有节点，隧道连到洛杉矶（日志里 `location=lax12`）。首次建连约 2.3 秒，其中 TLS 占 1.8 秒；同一连接上的后续请求约 0.5 秒。加上检索本身的一两秒，体感是「问一句等两秒」。要更快只有备案 + 国内直连。
+
+延迟不能接受的话，18443 那条直连可以留着当快通道，隧道留给在家或外出的场景——两条入口共用同一套鉴权和权限，不用改任何配置。
