@@ -189,6 +189,23 @@ def close_session(db, token):
     db.execute("DELETE FROM admin_session WHERE token_hash=%s", (token_hash(token),))
 
 
+def open_member_web_session(db, identifier, credential):
+    with db.transaction():
+        row = db.execute("""
+            SELECT id, COALESCE(display_name, id) FROM member_account
+            WHERE id=%s AND token_hash=%s AND enabled FOR UPDATE
+        """, (identifier, token_hash(credential))).fetchone()
+        if row is None:
+            raise ManagementError("账号或凭据不正确。")
+        token = "web_" + token_urlsafe(32)
+        db.execute("DELETE FROM member_web_session WHERE member_id=%s AND expires_at <= now()", (row[0],))
+        db.execute("""
+            INSERT INTO member_web_session (token_hash, member_id, expires_at)
+            VALUES (%s,%s,now()+interval '24 hours')
+        """, (token_hash(token), row[0]))
+    return {"token": token, "id": row[0], "name": row[1], "role": "member"}
+
+
 def libraries(db):
     return db.execute("SELECT id, name FROM knowledge_base ORDER BY name").fetchall()
 
@@ -505,9 +522,9 @@ def reset_member_token(db, member):
         raise ManagementError("成员标识无效。")
     token = token_urlsafe(32)
     with db.transaction():
-        if not db.execute("SELECT 1 FROM member_account WHERE id=%s", (member,)).fetchone():
+        if not db.execute("UPDATE member_account SET token_hash=%s WHERE id=%s", (token_hash(token), member)).rowcount:
             raise ManagementError("找不到此成员。")
-        db.execute("UPDATE member_account SET token_hash=%s WHERE id=%s", (token_hash(token), member))
+        db.execute("DELETE FROM member_web_session WHERE member_id=%s", (member,))
         member_event(db, member, "token_reset")
     return {"id": member, "token": token}
 
@@ -522,6 +539,8 @@ def set_member_state(db, member, enabled):
         if row[0] == enabled:
             return {"id": member, "enabled": enabled}
         db.execute("UPDATE member_account SET enabled=%s WHERE id=%s", (enabled, member))
+        if not enabled:
+            db.execute("DELETE FROM member_web_session WHERE member_id=%s", (member,))
         member_event(db, member, "enabled" if enabled else "disabled")
     return {"id": member, "enabled": enabled}
 
@@ -600,6 +619,29 @@ def task_feed(db, library=None, days=30):
 AUDIT_KINDS = {"publish": "发布", "rollback": "回滚", "unpublish": "下架", "restore": "恢复上线",
                "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问",
                "created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌"}
+
+
+def retrieval_feed(db, *, days, member, library, status, before, limit):
+    conditions = ["e.recorded_at >= now() - make_interval(days => %s)"]
+    parameters = [days]
+    for field, value in (("member_id", member), ("status", status), ("id", before)):
+        if value is not None:
+            conditions.append(f"e.{field} {'<' if field == 'id' else '='} %s")
+            parameters.append(value)
+    if library is not None:
+        conditions.append("(%s = ANY(e.searched_library_ids) OR %s = ANY(e.evidence_library_ids))")
+        parameters.extend((library, library))
+    with db.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute("""
+            SELECT e.id, e.recorded_at, e.member_id, COALESCE(m.display_name, e.member_id) AS member_name,
+                   e.status, e.channel, e.evidence_count, e.duration_ms, e.stages_ms,
+                   ARRAY(SELECT COALESCE(k.name, ids.id) FROM unnest(e.searched_library_ids) AS ids(id)
+                         LEFT JOIN knowledge_base k USING (id) ORDER BY COALESCE(k.name, ids.id)) AS searched_libraries,
+                   ARRAY(SELECT COALESCE(k.name, ids.id) FROM unnest(e.evidence_library_ids) AS ids(id)
+                         LEFT JOIN knowledge_base k USING (id) ORDER BY COALESCE(k.name, ids.id)) AS evidence_libraries
+            FROM retrieval_event e LEFT JOIN member_account m ON m.id=e.member_id
+            WHERE """ + " AND ".join(conditions) + " ORDER BY e.id DESC LIMIT %s", (*parameters, limit + 1)).fetchall()
+    return {"items": rows[:limit], "next_before": rows[limit - 1]["id"] if len(rows) > limit else None}
 
 
 def audit_feed(db, library=None, kind=None, limit=200):

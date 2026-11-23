@@ -1,6 +1,8 @@
 """Durable file parsing queue shared by the console and the parser worker."""
 import argparse
+import csv
 from hashlib import sha256
+from io import StringIO
 import logging
 import os
 from pathlib import Path
@@ -15,16 +17,22 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from admin import ManagementError, activate, build_indexes, index_errors, migrate, save_version
-from docling_parser import FORMATS, ParseError, evidence, result, submit, validate_file
+from docling_parser import FORMATS, MAX_FILE, ParseError, evidence, result, submit, validate_file
 
 
 LOG = logging.getLogger(__name__)
+QUEUED_SUFFIXES = FORMATS.keys() | {".csv"}
 FIELDS = """id, document_id, title, filename, status, attempts, last_error, created_at,
             publication_status, publication_error"""
 
 
 def queue(db, library, document, title, filename, content):
-    _, mime = validate_file(filename, content)
+    if Path(filename).suffix.lower() == ".csv":
+        if not 0 < len(content) <= MAX_FILE:
+            raise ParseError("请选择非空且不超过 20 MiB 的 CSV 文件。")
+        mime = "text/csv"
+    else:
+        _, mime = validate_file(filename, content)
     doc_id = str(document or uuid4())
     digest = sha256(content).hexdigest()
     with db.transaction():
@@ -140,6 +148,54 @@ def publish_next(db, hybrid):
         db.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
 
+def csv_evidence(data, job):
+    try:
+        original = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            original = data.decode("gb18030")
+        except UnicodeDecodeError:
+            raise ParseError("无法识别 CSV 编码，请另存为 UTF-8 CSV。") from None
+    if "\x00" in original:
+        raise ParseError("CSV 文件包含无效字符，请重新导出。")
+
+    reader = csv.reader(StringIO(original, newline=""), strict=True)
+    version = str(job["id"])
+    source = f"/v1/knowledge/files/{version}"
+    columns, chunks = [], []
+    header_line, previous_end = 0, 0
+    try:
+        for row in reader:
+            start, previous_end = previous_end + 1, reader.line_num
+            if not any(value.strip() for value in row):
+                continue
+            if not columns:
+                columns = [value.strip() or f"第 {index} 列" for index, value in enumerate(row, 1)]
+                header_line = start
+                continue
+            if len(row) != len(columns):
+                raise ParseError(f"CSV 第 {start} 行的列数与表头不一致。")
+            if len(chunks) == 2500:
+                raise ParseError("CSV 超过 2500 条数据，请拆成多个文件上传。")
+            text = "\n".join(f"{column}：{value}" for column, value in zip(columns, row))
+            if len(text) > 20000:
+                raise ParseError(f"CSV 第 {start} 行内容过长，请拆分此行后再上传。")
+            chunks.append({
+                "chunk_id": sha256(f"{version}:csv:{start}".encode()).hexdigest(),
+                "platform": "upload", "document_id": job["document_id"], "document_version": version,
+                "title": job["title"], "heading_path": [], "text": text,
+                "source_url": source, "reference_url": source,
+                "locator": {"position_unit": "csv_line", "line_start": start, "line_end": previous_end,
+                            "table_header_line": header_line},
+                "metadata": {},
+            })
+    except csv.Error:
+        raise ParseError(f"CSV 第 {previous_end + 1} 行格式有误，请检查分隔符或引号。") from None
+    if not chunks:
+        raise ParseError("CSV 需要表头和至少一条数据。")
+    return original, {"format": "csv", "columns": columns, "header_line": header_line}, chunks
+
+
 def claim(db):
     lease = uuid4()
     with db.transaction(), db.cursor(row_factory=dict_row) as cur:
@@ -149,7 +205,7 @@ def claim(db):
                 SELECT id FROM managed_file
                 WHERE status IN ('queued','parsing') AND next_check <= clock_timestamp()
                   AND (lease_until IS NULL OR lease_until <= clock_timestamp())
-                  AND (status='parsing' OR deadline <= clock_timestamp() OR (
+                  AND (status='parsing' OR deadline <= clock_timestamp() OR lower(right(filename,4))='.csv' OR (
                       SELECT count(*) FROM managed_file WHERE status='parsing' AND deadline > clock_timestamp()
                   ) < 4)
                 ORDER BY next_check, created_at
@@ -184,8 +240,8 @@ def fail(db, job, error):
            isinstance(error, ParseError) and error.task_missing, 3 * 2 ** attempt, job["id"], job["lease"]))
 
 
-def finish(db, job, payload):
-    original, structured, chunks = evidence(payload, job)
+def finish(db, job, parsed):
+    original, structured, chunks = parsed
     with db.transaction():
         if not db.execute("""
             SELECT 1 FROM managed_file WHERE id=%s AND lease=%s AND status='parsing' FOR UPDATE
@@ -212,12 +268,16 @@ def tick(db):
                              (job["id"], job["lease"])).fetchone()
             if row is None:
                 return True
-            remote = submit(job["filename"], row[0], FORMATS[Path(job["filename"]).suffix.lower()][0])
-            continue_job(db, job, remote)
+            suffix = Path(job["filename"]).suffix.lower()
+            if suffix == ".csv":
+                finish(db, job, csv_evidence(row[0], job))
+            else:
+                remote = submit(job["filename"], row[0], FORMATS[suffix][0])
+                continue_job(db, job, remote)
         elif (payload := result(remote)) is None:
             continue_job(db, job, remote, polled=True)
         else:
-            finish(db, job, payload)
+            finish(db, job, evidence(payload, job))
     except (ParseError, ManagementError) as error:
         fail(db, job, error)
     except (ValueError, TypeError, KeyError, AttributeError) as error:

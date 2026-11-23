@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Annotated, Literal
 from urllib.error import URLError
 
@@ -15,12 +16,13 @@ local_packages = ROOT / ".local" / "python"
 if local_packages.is_dir():
     sys.path.insert(0, str(local_packages))
 
-from fastapi import Depends, FastAPI, HTTPException, Path as PathParameter, Response
+from fastapi import Depends, FastAPI, HTTPException, Path as PathParameter, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import psycopg
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 
-from access import authorized_hybrid_query, authorized_query, authorized_reference, connect
+from access import QueryTrace, authorized_hybrid_query, authorized_query, authorized_reference, connect
 from metadata import normalize
 
 
@@ -29,6 +31,7 @@ bearer = HTTPBearer(auto_error=False)
 log = logging.getLogger(__name__)
 HYBRID_ENABLED = os.environ.get("KB_ENABLE_HYBRID") == "1"
 
+from admin import migrate
 from admin_api import router as admin_router
 app.include_router(admin_router(HYBRID_ENABLED))
 
@@ -98,17 +101,37 @@ def health():
 
 
 @app.post("/v1/knowledge/search", response_model=SearchResponse)
-def query(payload: SearchRequest, response: Response, token: Annotated[str, Depends(token_from_request)]):
+def query(payload: SearchRequest, request: Request, response: Response,
+          token: Annotated[str, Depends(token_from_request)]):
     response.headers["Cache-Control"] = "no-store"
+    started = perf_counter()
+    trace = QueryTrace()
+    channel = "mcp" if request.headers.get("X-KB-Channel") == "mcp" else "api"
     try:
         with connect() as connection:
             retrieve = authorized_hybrid_query if HYBRID_ENABLED else authorized_query
-            hits = retrieve(connection, token, payload.query, payload.limit, filters=payload.filters)
-            if not hits:
-                return SearchResponse(status="insufficient_evidence", evidence=[],
-                                      answer_guidance="没有检索到符合条件的授权证据。请说明资料不足和仍需确认的信息。")
-            return SearchResponse(status="evidence_found", evidence=[evidence_from_hit(hit) for hit in hits],
-                                  answer_guidance="逐项核对证据是否支持所问条件。说明有依据的部分和证据缺口，并引用原文。")
+            status, evidence, evidence_libraries = "unavailable", [], []
+            try:
+                hits = retrieve(connection, token, payload.query, payload.limit, filters=payload.filters, trace=trace)
+                evidence = [evidence_from_hit(hit) for hit in hits]
+                evidence_libraries = trace.evidence_libraries(hits)
+                status = "evidence_found" if evidence else "insufficient_evidence"
+            finally:
+                if trace.member_id is not None:
+                    duration = round((perf_counter() - started) * 1000)
+                    try:
+                        migrate(connection)
+                        connection.execute("""
+                            INSERT INTO retrieval_event (member_id, channel, status, searched_library_ids,
+                                evidence_library_ids, evidence_count, duration_ms, stages_ms)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (trace.member_id, channel, status, trace.searched_libraries, evidence_libraries,
+                              len(evidence), duration, Jsonb(trace.stages_ms)))
+                    except (psycopg.Error, OSError) as error:
+                        log.warning("Unable to record retrieval: %s", type(error).__name__)
+        guidance = ("逐项核对证据是否支持所问条件。说明有依据的部分和证据缺口，并引用原文。" if evidence
+                    else "没有检索到符合条件的授权证据。请说明资料不足和仍需确认的信息。")
+        return SearchResponse(status=status, evidence=evidence, answer_guidance=guidance)
     except PermissionError:
         raise unauthorized() from None
     except (psycopg.Error, OSError, URLError, ValueError, KeyError) as error:

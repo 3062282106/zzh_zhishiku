@@ -1,7 +1,5 @@
 import { auth, clearToken } from "./auth";
 
-const BASE = "/v1/admin";
-
 export class ApiError extends Error {
   constructor(message, status) {
     super(message);
@@ -11,7 +9,7 @@ export class ApiError extends Error {
 
 function explain(data, status) {
   if (data && typeof data.detail === "string") return data.detail;
-  if (status === 401) return "管理令牌已失效，请重新连接。";
+  if (status === 401) return "登录已过期，请重新登录。";
   if (status === 404) return "找不到对象，可能已被删除，请刷新后重试。";
   if (status === 409) return "数据已变化，请刷新后重试。";
   if (status === 413) return "文件超过大小上限。";
@@ -20,15 +18,16 @@ function explain(data, status) {
   return "请求失败（HTTP " + status + "）。";
 }
 
-export async function api(path, options = {}) {
-  const { method = "GET", body, signal, tokenOverride } = options;
-  const headers = { Authorization: "Bearer " + (tokenOverride ?? auth.token) };
+async function request(path, options = {}) {
+  const { method = "GET", body, signal, tokenOverride, raw = false } = options;
+  const token = tokenOverride ?? auth.token;
+  const headers = token ? { Authorization: "Bearer " + token } : {};
   const form = body instanceof FormData;
   if (body && !form) headers["Content-Type"] = "application/json";
 
   let response;
   try {
-    response = await fetch(BASE + path, {
+    response = await fetch(path, {
       method,
       headers,
       cache: "no-store",
@@ -40,16 +39,20 @@ export async function api(path, options = {}) {
     throw new ApiError("无法连接后台。请检查网络或 SSH 隧道，再重试。", 0);
   }
 
+  if (raw && response.ok) return response;
   const data = await response.json().catch(() => ({}));
   if (response.status === 401) {
     // Only drop the stored token when the request used it: a token being tried
     // out on the login screen must not touch the session.
-    if (!tokenOverride) clearToken();
-    const detail = data && typeof data.detail === "string" ? data.detail : "管理令牌已失效，请重新连接。";
+    if (tokenOverride === undefined && auth.token === token) clearToken();
+    const detail = data && typeof data.detail === "string" ? data.detail : "登录已过期，请重新登录。";
     throw new ApiError(detail, 401);
   }
   if (!response.ok) throw new ApiError(explain(data, response.status), response.status);
   return data;
 }
 
+export const api = (path, options) => request("/v1/admin" + path, options);
+export const sessionApi = (path, options) => request("/v1/session" + path, options);
+export const knowledgeApi = (path, options) => request("/v1/knowledge" + path, options);
 export const enc = (value) => encodeURIComponent(String(value));

@@ -131,3 +131,22 @@ CREATE TABLE IF NOT EXISTS admin_session (
     expires_at timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS admin_session_expiry ON admin_session(expires_at);
+CREATE TABLE IF NOT EXISTS retrieval_event (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    member_id text NOT NULL,
+    channel text NOT NULL CHECK (channel IN ('mcp', 'api')),
+    status text NOT NULL CHECK (status IN ('evidence_found', 'insufficient_evidence', 'unavailable')),
+    searched_library_ids text[] NOT NULL,
+    evidence_library_ids text[] NOT NULL,
+    evidence_count integer NOT NULL,
+    duration_ms integer NOT NULL,
+    stages_ms jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS retrieval_event_recorded_at ON retrieval_event(recorded_at);
+CREATE TABLE IF NOT EXISTS member_web_session (
+    token_hash text PRIMARY KEY,
+    member_id text NOT NULL REFERENCES member_account(id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS member_web_session_member ON member_web_session(member_id);

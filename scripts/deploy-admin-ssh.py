@@ -11,8 +11,8 @@ import tarfile
 
 
 REQUIRED = {
-    "admin.py", "admin_api.py", "admin_schema.sql", "api.py", "docling_parser.py", "feishu_source.py",
-    "file_ingest.py", "notion_source.py", "search.py", "schema.sql",
+    "access.py", "admin.py", "admin_api.py", "admin_schema.sql", "api.py", "docling_parser.py", "feishu_source.py",
+    "file_ingest.py", "mcp_server.py", "notion_source.py", "search.py", "schema.sql",
     "scripts/deploy-admin.sh", "scripts/verify-admin-cloud.py", "scripts/configure-notion.sh",
     "scripts/configure-mcp-entry.sh", "scripts/configure-admin-entry.sh",
 }
@@ -60,8 +60,6 @@ def deployment_command(bundle, notion_page=None, notion_library=None, notion_tit
             'bash "$release/scripts/configure-notion.sh" '
             f'{shlex.quote(notion_page)} {shlex.quote(notion_library)} {title}\n'
         )
-    else:
-        script += '/opt/knowledge-kb/.venv/bin/python "$release/scripts/verify-admin-cloud.py"\n'
     if tunnel:
         script += "printf '%s\\n' 'Admin: http://127.0.0.1:18086/admin' 'Keep this window open.'\nexec sleep infinity\n"
     return "bash -c " + shlex.quote(script)

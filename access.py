@@ -1,12 +1,15 @@
 """Manage the local access fixture and query OpenSearch through PostgreSQL permissions."""
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
 import sys
+from time import perf_counter
 
 ROOT = Path(__file__).resolve().parent
 PRIVATE = ROOT / ".local"
@@ -23,8 +26,7 @@ from search import DEFAULT_CHUNKS, lookup, passage, search, vector_search
 
 ACCOUNTS = PRIVATE / "test-accounts.json"
 ACCOUNTS_TO_LIBRARIES = {"operations-test": "notion", "support-test": "feishu"}
-VISIBLE = """
-    SELECT c.chunk_id
+VISIBLE_FROM = """
     FROM member_account m
     JOIN knowledge_grant g ON g.member_id = m.id
     JOIN source_document d ON d.kb_id = g.kb_id
@@ -36,6 +38,34 @@ VISIBLE = """
       AND (d.valid_from IS NULL OR d.valid_from <= statement_timestamp())
       AND (d.valid_until IS NULL OR d.valid_until > statement_timestamp())
 """
+VISIBLE = "SELECT c.chunk_id\n" + VISIBLE_FROM
+
+
+@dataclass
+class QueryTrace:
+    member_id: str | None = None
+    chunk_libraries: dict[str, str] = field(default_factory=dict)
+    searched_libraries: list[str] = field(default_factory=list)
+    stages_ms: dict[str, int] = field(default_factory=dict)
+
+    def mark_search(self):
+        self.searched_libraries = sorted(set(self.chunk_libraries.values()))
+
+    def evidence_libraries(self, hits):
+        return sorted({self.chunk_libraries[hit["chunk_id"]] for hit in hits
+                       if hit["chunk_id"] in self.chunk_libraries})
+
+
+@contextmanager
+def measure(trace, stage):
+    if trace is None:
+        yield
+        return
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        trace.stages_ms[stage] = trace.stages_ms.get(stage, 0) + round((perf_counter() - started) * 1000)
 
 
 def connect():
@@ -47,6 +77,30 @@ def connect():
 
 def token_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def is_member_web_token(token):
+    # Existing MCP tokens are 43 characters and keep their own credential path.
+    return len(token) == 47 and token.startswith("web_")
+
+
+def member_web_identity(db, token):
+    if not is_member_web_token(token):
+        return None
+    return db.execute("""
+        SELECT m.id, COALESCE(m.display_name, m.id), m.token_hash
+        FROM member_web_session s JOIN member_account m ON m.id=s.member_id
+        WHERE s.token_hash=%s AND s.expires_at > now() AND m.enabled
+    """, (token_hash(token),)).fetchone()
+
+
+def reader_digest(db, token):
+    if is_member_web_token(token):
+        member = member_web_identity(db, token)
+        if member is None:
+            raise PermissionError("Invalid or expired member session")
+        return member[2]
+    return token_hash(token)
 
 
 def fixture_tokens():
@@ -97,40 +151,52 @@ def seed(connection):
     print(f"Registered {len(chunks)} chunks, {len(documents)} documents and 2 local test accounts.")
 
 
-def authorized_ids(connection, token, subset=None):
-    digest = token_hash(token)
-    if subset is None:
-        if connection.execute("SELECT 1 FROM member_account WHERE token_hash = %s AND enabled",
-                              (digest,)).fetchone() is None:
-            raise PermissionError("Invalid or disabled local test account")
-        statement, parameters = VISIBLE, (digest,)
-    else:
-        statement, parameters = VISIBLE + " AND c.chunk_id = ANY(%s)", (digest, list(subset))
-    return {row[0] for row in connection.execute(statement, parameters).fetchall()}
+def authorized_ids(connection, token, subset=None, *, trace=None):
+    with measure(trace, "authorization"):
+        digest = reader_digest(connection, token)
+        if subset is not None:
+            rows = connection.execute(VISIBLE + " AND c.chunk_id = ANY(%s)", (digest, list(subset))).fetchall()
+            return {row[0] for row in rows}
+        member = connection.execute("SELECT id FROM member_account WHERE token_hash = %s AND enabled",
+                                    (digest,)).fetchone()
+        if member is None:
+            raise PermissionError("Invalid or disabled knowledge member")
+        if trace is None:
+            return {row[0] for row in connection.execute(VISIBLE, (digest,)).fetchall()}
+        trace.member_id = member[0]
+        trace.chunk_libraries = dict(connection.execute("SELECT c.chunk_id, d.kb_id\n" + VISIBLE_FROM,
+                                                        (digest,)).fetchall())
+        return set(trace.chunk_libraries)
 
 
-def authorized_query(connection, token, question, limit=5, *, filters=None):
-    allowed = authorized_ids(connection, token)
-    hits = search(question, limit, allowed, filters)
+def authorized_query(connection, token, question, limit=5, *, filters=None, trace=None):
+    allowed = authorized_ids(connection, token, trace=trace)
+    if trace is not None:
+        trace.mark_search()
+    with measure(trace, "recall"):
+        hits = search(question, limit, allowed, filters)
     if not hits:
         return []
-    still_allowed = authorized_ids(connection, token, [hit["chunk_id"] for hit in hits])
+    still_allowed = authorized_ids(connection, token, [hit["chunk_id"] for hit in hits], trace=trace)
     return [hit for hit in hits if hit["chunk_id"] in still_allowed]
 
 
-def authorized_fusion_candidates(connection, token, question, *, allow_fallback=True, filters=None):
-    allowed = authorized_ids(connection, token)
+def authorized_fusion_candidates(connection, token, question, *, allow_fallback=True, filters=None, trace=None):
+    allowed = authorized_ids(connection, token, trace=trace)
     if not allowed:
         return []
-    lexical = search(question, 50, allowed, filters)
-    try:
-        vector = dashscope_models.embed([question], "query")[0]
-        semantic = vector_search(vector, 50, allowed, filters)
-    except (dashscope_models.ModelError, OSError):
-        if not allow_fallback:
-            raise
-        print("Vector retrieval unavailable; using authorized keyword results.", file=sys.stderr)
-        semantic = []
+    if trace is not None:
+        trace.mark_search()
+    with measure(trace, "recall"):
+        lexical = search(question, 50, allowed, filters)
+        try:
+            vector = dashscope_models.embed([question], "query")[0]
+            semantic = vector_search(vector, 50, allowed, filters)
+        except (dashscope_models.ModelError, OSError):
+            if not allow_fallback:
+                raise
+            print("Vector retrieval unavailable; using authorized keyword results.", file=sys.stderr)
+            semantic = []
 
     scores, candidates = {}, {}
     for ranking in (lexical, semantic):
@@ -140,29 +206,30 @@ def authorized_fusion_candidates(connection, token, question, *, allow_fallback=
             scores[chunk_id] = scores.get(chunk_id, 0) + 1 / (60 + rank)
     if not candidates:
         return []
-    permitted = authorized_ids(connection, token, candidates)
+    permitted = authorized_ids(connection, token, candidates, trace=trace)
     combined = sorted(permitted, key=lambda chunk_id: (-scores[chunk_id], chunk_id))[:30]
     return [{**candidates[chunk_id], "rrf_score": scores[chunk_id]} for chunk_id in combined]
 
 
-def authorized_rerank(connection, token, question, hits, limit, *, allow_fallback=True):
+def authorized_rerank(connection, token, question, hits, limit, *, allow_fallback=True, trace=None):
     if not hits:
         return []
     try:
-        ranked = dashscope_models.rerank(question, [passage(hit) for hit in hits], limit)
+        with measure(trace, "rerank"):
+            ranked = dashscope_models.rerank(question, [passage(hit) for hit in hits], limit)
         hits = [{**hits[index], "rerank_score": score} for index, score in ranked]
     except dashscope_models.ModelError:
         if not allow_fallback:
             raise
         print("Rerank unavailable; using authorized fusion results.", file=sys.stderr)
         hits = hits[:limit]
-    permitted = authorized_ids(connection, token, [hit["chunk_id"] for hit in hits])
+    permitted = authorized_ids(connection, token, [hit["chunk_id"] for hit in hits], trace=trace)
     return [hit for hit in hits if hit["chunk_id"] in permitted]
 
 
-def authorized_hybrid_query(connection, token, question, limit=5, *, filters=None):
-    hits = authorized_fusion_candidates(connection, token, question, filters=filters)
-    return authorized_rerank(connection, token, question, hits, limit)
+def authorized_hybrid_query(connection, token, question, limit=5, *, filters=None, trace=None):
+    hits = authorized_fusion_candidates(connection, token, question, filters=filters, trace=trace)
+    return authorized_rerank(connection, token, question, hits, limit, trace=trace)
 
 
 def authorized_reference(connection, token, chunk_id):

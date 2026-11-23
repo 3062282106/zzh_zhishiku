@@ -4,24 +4,24 @@ import os
 from pathlib import Path
 from secrets import compare_digest
 from time import monotonic
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
 
-from access import VISIBLE, connect, token_hash
+from access import VISIBLE, connect, is_member_web_token, member_web_identity, reader_digest, token_hash
 from admin import (ManagementError, activate, admin_directory, audit_feed, close_session, create_admin,
-                   create_member, documents, libraries, member_directory, migrate, open_session, preview,
-                   probe, reset_member_token, resolve_session, set_admin_password, set_admin_state,
+                   create_member, documents, libraries, member_directory, migrate, open_member_web_session, open_session, preview,
+                   probe, reset_member_token, resolve_session, retrieval_feed, set_admin_password, set_admin_state,
                    set_availability, set_member_grants, set_member_state, set_owner, task_feed, upload,
                    versions)
 from feishu_source import bind_feishu, fetch_feishu_section
-from docling_parser import FORMATS, MAX_FILE, ParseError
-from file_ingest import jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
+from docling_parser import MAX_FILE, ParseError
+from file_ingest import QUEUED_SUFFIXES, jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
 from notion_source import SourceError, bind_notion, list_sources, sync_source
 
 
@@ -52,13 +52,18 @@ def admin_identity(credentials: Annotated[HTTPAuthorizationCredentials | None, D
         raise HTTPException(401, "请先登录。")
     token = credentials.credentials
     if len(secret) >= 32 and compare_digest(secret.encode(), token.encode()):
-        return {"id": "deploy", "username": "deploy", "name": "部署令牌"}
+        return {"id": "deploy", "username": "deploy", "name": "部署令牌", "role": "service"}
     with connect() as db:
         migrate(db)
         row = resolve_session(db, token)
     if not row:
         raise HTTPException(401, "登录已过期，请重新登录。")
-    return {"id": row["id"], "username": row["username"], "name": row["display_name"] or row["username"]}
+    return admin_profile(row)
+
+
+def admin_profile(row):
+    return {"id": row["id"], "username": row["username"], "name": row["display_name"] or row["username"],
+            "role": "admin"}
 
 
 # Login throttling stays in-process: there is one uvicorn worker, and a shared table
@@ -83,6 +88,13 @@ def reader_identity(credentials: Annotated[HTTPAuthorizationCredentials | None, 
     if not credentials:
         raise HTTPException(401, "需要知识库访问令牌。")
     return credentials.credentials
+
+
+def member_file_digest(db, token):
+    try:
+        return reader_digest(db, token)
+    except PermissionError:
+        raise HTTPException(401, "登录已过期，请重新登录。") from None
 
 
 class LibraryRequest(BaseModel):
@@ -191,6 +203,44 @@ def router(hybrid):
             except ManagementError as error:
                 _record_failure(key)
                 raise HTTPException(401, str(error)) from None
+
+    @routes.post("/v1/session/login")
+    def console_login(payload: LoginRequest, response: Response):
+        key = payload.username.lower()
+        if _throttled(key):
+            raise HTTPException(429, "尝试次数太多，请 5 分钟后再试。")
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db:
+            migrate(db)
+            try:
+                return {**open_session(db, payload.username, payload.password), "role": "admin"}
+            except ManagementError:
+                try:
+                    return open_member_web_session(db, payload.username, payload.password)
+                except ManagementError:
+                    _record_failure(key)
+                    raise HTTPException(401, "账号或凭据不正确。") from None
+
+    @routes.get("/v1/session/me")
+    def console_me(response: Response, token: Annotated[str, Depends(reader_identity)]):
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db:
+            migrate(db)
+            if member := member_web_identity(db, token):
+                return {"id": member[0], "name": member[1], "role": "member"}
+            if row := resolve_session(db, token):
+                return admin_profile(row)
+        raise HTTPException(401, "登录已过期，请重新登录。")
+
+    @routes.post("/v1/session/logout")
+    def console_logout(token: Annotated[str, Depends(reader_identity)]):
+        with connect() as db:
+            migrate(db)
+            if is_member_web_token(token):
+                db.execute("DELETE FROM member_web_session WHERE token_hash=%s", (token_hash(token),))
+            else:
+                close_session(db, token)
+        return {"ok": True}
 
     @routes.post("/v1/admin/logout")
     def logout(identity: Annotated[dict, Depends(admin_identity)],
@@ -322,6 +372,23 @@ def router(hybrid):
             migrate(db)
             return audit_feed(db, library, kind, max(1, min(limit, 500)))
 
+    @control.get("/retrieval-records")
+    def retrieval_records(
+        identity: Annotated[dict, Depends(admin_identity)], response: Response,
+        days: Annotated[int, Query(ge=1, le=30)] = 7,
+        member: Annotated[str | None, Query(min_length=1, max_length=160)] = None,
+        library: Annotated[str | None, Query(min_length=1, max_length=160)] = None,
+        status: Literal["evidence_found", "insufficient_evidence", "unavailable"] | None = None,
+        before: Annotated[int | None, Query(ge=1, le=2**63 - 1)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    ):
+        if identity["role"] != "admin":
+            raise HTTPException(403, "请使用管理员账号登录查看检索记录。")
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db:
+            return retrieval_feed(db, days=days, member=member, library=library, status=status,
+                                  before=before, limit=limit)
+
     @control.put("/documents/{document}/owner")
     def owner(document: UUID, payload: OwnerRequest):
         try:
@@ -394,7 +461,7 @@ def router(hybrid):
                     document_id: Annotated[UUID | None, Form()] = None):
         filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
         suffix = Path(filename).suffix.lower()
-        if len(filename) <= 200 and suffix in FORMATS:
+        if len(filename) <= 200 and suffix in QUEUED_SUFFIXES:
             data = file.file.read(MAX_FILE + 1)
             if len(data) > MAX_FILE:
                 raise HTTPException(413, "上传文件超过 20 MiB。")
@@ -403,8 +470,8 @@ def router(hybrid):
                     return {"job": queue_file(db, library, document_id, title, filename, data)}
             except (ManagementError, ParseError) as error:
                 raise HTTPException(422, str(error)) from None
-        if len(filename) > 200 or Path(filename).suffix.lower() not in (".md", ".txt"):
-            raise HTTPException(422, "请选择 PDF、DOCX、XLSX、PPTX、扫描图片、Markdown 或 TXT。")
+        if len(filename) > 200 or suffix not in (".md", ".txt"):
+            raise HTTPException(422, "请选择 PDF、DOCX、XLSX、CSV、PPTX、扫描图片、Markdown 或 TXT。")
         limit = 256 * 1024
         try:
             data = file.file.read(limit + 1)
@@ -488,8 +555,8 @@ def router(hybrid):
 
     @routes.get("/v1/knowledge/originals/{document}/{version}")
     def original(document: UUID, version: UUID, token: Annotated[str, Depends(reader_identity)]):
-        digest = token_hash(token)
         with connect() as db:
+            digest = member_file_digest(db, token)
             if not db.execute("SELECT 1 FROM member_account WHERE token_hash=%s AND enabled", (digest,)).fetchone():
                 raise HTTPException(401, "无效的知识库令牌。")
             row = db.execute("""
@@ -504,8 +571,8 @@ def router(hybrid):
 
     @routes.get("/v1/knowledge/files/{version}")
     def original_file(version: UUID, token: Annotated[str, Depends(reader_identity)]):
-        digest = token_hash(token)
         with connect() as db:
+            digest = member_file_digest(db, token)
             if not db.execute("SELECT 1 FROM member_account WHERE token_hash=%s AND enabled", (digest,)).fetchone():
                 raise HTTPException(401, "无效的知识库令牌。")
             row = db.execute("""

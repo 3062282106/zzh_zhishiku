@@ -11,7 +11,7 @@ const props = defineProps({
 });
 const emit = defineEmits(["close", "uploaded"]);
 
-const ACCEPT = ".md,.txt,.pdf,.docx,.xlsx,.pptx,.png,.jpg,.jpeg,.tif,.tiff";
+const ACCEPT = ".md,.txt,.pdf,.docx,.xlsx,.csv,.pptx,.png,.jpg,.jpeg,.tif,.tiff";
 const library = () => libraryById(props.libraryId);
 
 const title = ref("");
@@ -73,7 +73,7 @@ async function upload() {
            @click="picker.click()" @keydown.enter="picker.click()"
            @dragover.prevent="dragging = true" @dragleave="dragging = false" @drop="dropped">
         <b>{{ file ? file.name : "将文件拖到此处，或选择文件" }}</b>
-        <span>{{ file ? "已选择 · 上传后自动开始解析" : "PDF、Word、Excel、PPT、扫描图片、Markdown、TXT，最大 20 MiB" }}</span>
+        <span>{{ file ? "已选择 · 上传后自动开始解析" : "PDF、Word、Excel、CSV、PPT、扫描图片、Markdown、TXT" }}</span>
       </div>
       <input ref="picker" type="file" hidden :accept="ACCEPT" @change="choose">
     </div>

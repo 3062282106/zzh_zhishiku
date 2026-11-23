@@ -154,6 +154,9 @@ function guideText(person, token) {
     "",
     "给：" + (person.name || person.id),
     "",
+    "网页查询：" + window.location.origin + "/admin/",
+    "网页登录填写成员 ID「" + person.id + "」和下面的令牌。",
+    "",
     "一、在客户端里新建一个自定义连接器（或 MCP 服务器）",
     "二、传输类型选 HTTP",
     "三、服务器 URL 填：" + url,
@@ -257,7 +260,8 @@ async function copy(text, label) {
         <span class="pill draft">{{ member.kind === "guest" ? "受邀个人" : "企业员工" }}</span>
         <span v-if="!member.enabled" class="pill expired">已停用</span>
       </div>
-      <div class="t-sub">{{ member.email || member.id }}</div>
+      <div v-if="member.email" class="t-sub">{{ member.email }}</div>
+      <div class="t-sub">成员 ID {{ member.id }}</div>
     </div>
 
     <div class="field">
@@ -332,6 +336,7 @@ async function copy(text, label) {
     <div class="block">
       <div class="k">成员</div>
       <div class="v"><b>{{ issued.name }}</b><span v-if="issued.email" class="t-sub"> · {{ issued.email }}</span></div>
+      <div class="k">成员 ID</div><div class="mono">{{ issued.id }}</div>
     </div>
 
     <div class="field">

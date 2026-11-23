@@ -2,7 +2,7 @@
  * Headless console QA: drives the built Vue app through Chrome DevTools Protocol,
  * captures a screenshot per screen and fails on any page error or CSP violation.
  *
- *   npm run qa                 # requires the API on :18081 and KB_ADMIN_TOKEN
+ *   npm run qa                 # requires the API on :18081, KB_ADMIN_USER and KB_ADMIN_PASSWORD
  *   QA_UPLOAD=1 npm run qa     # also uploads .local/qa-console/upload.md
  *
  * The upload run leaves one draft document behind; it is off by default so a
@@ -15,13 +15,14 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const BASE = process.env.QA_BASE || "http://127.0.0.1:18081";
-const TOKEN = process.env.KB_ADMIN_TOKEN || "";
+const USER = process.env.KB_ADMIN_USER || "";
+const PASSWORD = process.env.KB_ADMIN_PASSWORD || "";
 const OUT = process.env.QA_OUT || ".local/qa-console";
 const PORT = Number(process.env.QA_CDP_PORT || 9333);
 const CHROME = process.env.CHROME || "C:/Program Files/Google/Chrome/Application/chrome.exe";
 
-if (!TOKEN) {
-  console.error("Set KB_ADMIN_TOKEN to the token the API is running with.");
+if (!USER || !PASSWORD) {
+  console.error("Set KB_ADMIN_USER and KB_ADMIN_PASSWORD for the console QA account.");
   process.exit(2);
 }
 
@@ -113,7 +114,7 @@ async function goto(path) {
 
 async function evaluate(expression) {
   const result = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.text + " " + expression);
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
   return result.result.value;
 }
 
@@ -123,6 +124,19 @@ async function shot(name) {
 }
 
 const results = [];
+async function submitCredentials(password) {
+  await evaluate(`(() => {
+    const form = document.querySelector('.login form');
+    const [username, password] = form.querySelectorAll('input');
+    username.value = ${JSON.stringify(USER)};
+    password.value = ${JSON.stringify(password)};
+    username.dispatchEvent(new Event('input', { bubbles: true }));
+    password.dispatchEvent(new Event('input', { bubbles: true }));
+    form.requestSubmit();
+  })()`);
+  await sleep(1800);
+}
+
 function check(name, ok, detail) {
   results.push({ name, ok, detail });
   console.log((ok ? "PASS  " : "FAIL  ") + name + (detail ? "  ·  " + detail : ""));
@@ -141,10 +155,14 @@ try {
   await goto("/admin/");
   const loginTitle = await evaluate("(document.querySelector('.login h1')||{}).textContent || ''");
   await shot("01-login");
-  check("登录页 · 令牌入口", loginTitle.includes("连接管理后台"), loginTitle);
+  check("登录页 · 统一入口", loginTitle === "登录知识库", loginTitle);
 
-  await evaluate(`sessionStorage.setItem('kb.admin.token', ${JSON.stringify(TOKEN)}); location.reload();`);
-  await sleep(1800);
+  await submitCredentials(PASSWORD);
+  const TOKEN = await evaluate("sessionStorage.getItem('kb.admin.token')");
+  if (!TOKEN) {
+    check("管理员登录", false, "未收到管理员会话");
+    throw new Error("Administrator sign-in failed");
+  }
 
   const libraries = await (await fetch(BASE + "/v1/admin/libraries", {
     headers: { Authorization: "Bearer " + TOKEN },
@@ -334,13 +352,7 @@ try {
     const deep = "/admin/kb/" + library.id + "/doc/" + doc.id;
     await goto(deep);
     check("深链 · 未登录先看到登录页", await evaluate("!!document.querySelector('.login')"), "");
-    await evaluate(`(() => {
-      const input = document.querySelector('.login input');
-      input.value = ${JSON.stringify(TOKEN)};
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      document.querySelector('.login form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    })()`);
-    await sleep(1800);
+    await submitCredentials(PASSWORD);
     const landed = await evaluate("({ title: (document.querySelector('.doc-head h1')||{}).textContent || '', path: location.pathname })");
     check("深链 · 登录后回到该文档", landed.title === doc.title && landed.path === deep, landed.path);
   }
@@ -355,18 +367,12 @@ try {
     check("侧栏 · 保留当前知识库", kept === second, kept);
   }
 
-  // A wrong token must say so on the login card instead of failing silently.
+  // Invalid credentials should display an error on the login card.
   await evaluate("sessionStorage.clear()");
   await goto("/admin/");
-  await evaluate(`(() => {
-    const input = document.querySelector('.login input');
-    input.value = 'definitely-not-the-token';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    document.querySelector('.login form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-  })()`);
-  await sleep(1500);
+  await submitCredentials("definitely-not-the-password");
   const loginError = await evaluate("(document.querySelector('.login .err')||{}).textContent || ''");
-  check("登录 · 错误令牌有提示", loginError.includes("令牌"), loginError);
+  check("登录 · 无效凭据有提示", loginError.includes("凭据"), loginError);
   await shot("19-login-error");
 } finally {
   const failed = results.filter((item) => !item.ok);

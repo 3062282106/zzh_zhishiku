@@ -50,6 +50,10 @@ export function ext(filename) {
 /** Where a chunk came from, in the reader's words. */
 export function chunkWhere(chunk, index) {
   const locator = (chunk && chunk.locator) || {};
+  if (locator.position_unit === "csv_line") {
+    const lines = locator.line_start === locator.line_end ? locator.line_start : `${locator.line_start}–${locator.line_end}`;
+    return `CSV 第 ${lines} 行`;
+  }
   if (locator.worksheets && locator.worksheets.length) return "工作表 " + locator.worksheets.join("、");
   if (locator.pages && locator.pages.length) {
     const unit = { worksheet_cell: "张工作表", slide: "张幻灯片" }[locator.position_unit] || "页";

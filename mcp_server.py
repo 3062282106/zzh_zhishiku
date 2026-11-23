@@ -35,7 +35,7 @@ OPENER = build_opener(ProxyHandler({}), RejectRedirects())
 
 def request(path, token, body=None):
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "X-KB-Channel": "mcp"}
     if data is not None:
         headers["Content-Type"] = "application/json"
     try:

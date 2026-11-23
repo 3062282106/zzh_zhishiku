@@ -18,13 +18,13 @@ test -s "$envfile"
 systemctl is-active --quiet knowledge-kb-api.service
 systemctl is-active --quiet knowledge-kb-mcp.service
 
-files=(admin.py admin_api.py admin_schema.sql api.py docling_parser.py feishu_source.py file_ingest.py
-       notion_source.py search.py schema.sql)
+files=(access.py admin.py admin_api.py admin_schema.sql api.py docling_parser.py feishu_source.py file_ingest.py
+       mcp_server.py notion_source.py search.py schema.sql)
 for file in "${files[@]}"; do
   test -s "$release/$file"
 done
 "$app/.venv/bin/python" -m py_compile \
-  "$release"/{admin.py,admin_api.py,api.py,docling_parser.py,feishu_source.py,file_ingest.py,notion_source.py,search.py}
+  "$release"/{access.py,admin.py,admin_api.py,api.py,docling_parser.py,feishu_source.py,file_ingest.py,mcp_server.py,notion_source.py,search.py}
 
 # The console is a Vite build served from web/dist. Build it before packaging:
 #   npm --prefix web ci && npm --prefix web run build
@@ -136,4 +136,12 @@ for service in knowledge-kb-parser.service knowledge-kb-publisher.service; do
     systemctl restart "$service"
   fi
 done
+for attempt in {1..10}; do
+  mcp_status=$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' http://127.0.0.1:18082/mcp || true)
+  [[ "$mcp_status" == 401 ]] && break
+  sleep 1
+done
+[[ "$mcp_status" == 401 ]] || { echo "MCP HTTP $mcp_status，预期 401。" >&2; exit 1; }
 deployed=true
