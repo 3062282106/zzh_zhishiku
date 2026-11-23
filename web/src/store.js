@@ -10,6 +10,9 @@ export const store = reactive({
   members: [],
   audit: [],
   probeMember: "",
+  // Deployment-specific values that must not be baked into the bundle, e.g. the
+  // address colleagues put in their MCP client.
+  settings: { mcp_url: "" },
   // Remembers the library you were last in, so the sidebar link does not bounce
   // you back to the first one.
   activeLibrary: "",
@@ -58,6 +61,11 @@ export async function loadAudit() {
   return store.audit;
 }
 
+export async function loadSettings() {
+  store.settings = await api("/settings");
+  return store.settings;
+}
+
 export async function loadVersions(documentId) {
   return api("/documents/" + enc(documentId) + "/versions");
 }
@@ -69,7 +77,7 @@ export async function loadPreview(documentId, versionId) {
 /** Everything the shell needs before the first paint of a page. */
 export async function loadShell() {
   await loadLibraries();
-  const results = await Promise.allSettled([loadTasks(), loadMembers(), loadAudit()]);
+  const results = await Promise.allSettled([loadTasks(), loadMembers(), loadAudit(), loadSettings()]);
   return results.find((item) => item.status === "rejected") || null;
 }
 

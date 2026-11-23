@@ -13,8 +13,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
 
 from access import VISIBLE, connect, token_hash
-from admin import (ManagementError, activate, audit_feed, documents, libraries, member_directory, migrate, preview,
-                   probe, set_availability, set_member_grants, set_owner, task_feed, upload, versions)
+from admin import (ManagementError, activate, audit_feed, create_member, documents, libraries, member_directory,
+                   migrate, preview, probe, reset_member_token, set_availability, set_member_grants,
+                   set_member_state, set_owner, task_feed, upload, versions)
 from feishu_source import bind_feishu, fetch_feishu_section
 from docling_parser import FORMATS, MAX_FILE, ParseError
 from file_ingest import jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
@@ -80,6 +81,18 @@ class MemberGrantRequest(BaseModel):
     expires_at: datetime | None = None
 
 
+class MemberCreate(BaseModel):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+    email: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] = ""
+    libraries: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]] = []
+    expires_at: datetime | None = None
+    kind: Annotated[str, StringConstraints(strip_whitespace=True, max_length=20)] = "employee"
+
+
+class MemberState(BaseModel):
+    enabled: bool
+
+
 class OwnerRequest(BaseModel):
     owner: Annotated[str, StringConstraints(strip_whitespace=True, max_length=120)]
 
@@ -136,6 +149,43 @@ def router(hybrid):
         with connect() as db:
             migrate(db)
             return member_directory(db)
+
+    @control.post("/members", status_code=201)
+    def add_member(payload: MemberCreate):
+        if payload.kind not in ("employee", "guest"):
+            raise HTTPException(422, "身份类型只能是 employee 或 guest。")
+        try:
+            with connect() as db:
+                migrate(db)
+                return create_member(db, payload.name, payload.email, payload.libraries,
+                                     payload.expires_at, payload.kind)
+        except ManagementError as error:
+            raise HTTPException(422, str(error)) from None
+
+    @control.post("/members/{member}/token")
+    def rotate_token(member: str):
+        try:
+            with connect() as db:
+                migrate(db)
+                return reset_member_token(db, member)
+        except ManagementError as error:
+            raise HTTPException(404, str(error)) from None
+
+    @control.put("/members/{member}/state")
+    def switch_member(member: str, payload: MemberState):
+        try:
+            with connect() as db:
+                migrate(db)
+                return set_member_state(db, member, payload.enabled)
+        except ManagementError as error:
+            raise HTTPException(404, str(error)) from None
+
+    @control.get("/settings")
+    def settings():
+        # The address colleagues put in their MCP client. It is deployment-specific
+        # (tunnel, LAN entry, or a proxied hostname), so it lives in api.env rather
+        # than being baked into the console bundle.
+        return {"mcp_url": os.environ.get("KB_MCP_PUBLIC_URL", "").strip()}
 
     @control.post("/members/{member}/grants")
     def replace_grants(member: str, payload: MemberGrantRequest):

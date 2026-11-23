@@ -28,24 +28,30 @@ python scripts/deploy-admin-ssh.py <ECS_IP> --tunnel
 
 回到知识库 ECS 后执行 `sudo bash scripts/configure-parser-worker.sh`，按终端提示输入解析服务根地址和密钥。密钥由脚本写入 `/etc/knowledge-kb/parser.env`。脚本启动 `knowledge-kb-parser` 和 `knowledge-kb-publisher`，发布 worker 读取 API 已有的检索和百炼配置。将获批的文档传入后台，草稿就绪后核对预览并提交发布。后台显示处理状态和失败原因，通过 `systemctl is-active knowledge-kb-parser knowledge-kb-publisher` 检查服务。原件与解析结果随 PostgreSQL 数据进入现有备份范围。
 
-### 在同一台 ECS 上装解析服务（没有 Docker 时）
+### 用本机 Docling 当解析主机（服务器内存不够时）
 
-ECS 上没有 Docker 时，`scripts/configure-docling-serve.sh` 用独立虚拟环境把 Docling Serve 装在 `/opt/docling`，只监听回环地址，不进入 API 的 `/opt/knowledge-kb/.venv`，所以后台重新部署不必重下 torch：
+4 GiB 的 ECS 上 PostgreSQL 和 OpenSearch 已经占掉 2.2 GiB，而 Docling 模型常驻约 1.2 GiB，同机塞不下。这种情况让服务器只跑解析 worker，Docling 留在开发机上，用 SSH 反向隧道接过去：
 
 ```bash
-sudo bash scripts/configure-docling-serve.sh          # 默认 127.0.0.1:18112
-sudo KB_DOCLING_PORT=18113 bash scripts/configure-docling-serve.sh   # 换端口
+# 开发机：把本机 Docling 的端口转发到服务器的回环地址
+ssh -N -R 18111:127.0.0.1:18111 root@<ECS_IP>
+
+# 开发机：本机起 Docling（见「本地解析 PDF」一节）
 ```
 
-脚本会补 2 GiB swap、装 `torch`/`torchvision`（CPU wheel）、`docling-serve`、`onnxruntime`，写 `docling-serve.service`，并把 `parser.env` 的 `KB_DOCLING_URL` 指向该端口。装完用后台传一份扫描件验证：任务从「等待中」走到「已完成」，预览里能看到 OCR 出来的正文。模型约 509 MiB，第一次解析时从 `HF_ENDPOINT=https://hf-mirror.com` 下载并缓存在 `/opt/docling/.cache`，之后每次解析不再下载。
+服务器上 `parser.env` 指向那个回环端口即可，`configure-parser-worker.sh` 输入 `http://127.0.0.1:18111`：
 
-三个会让它「装好却起不来」的坑，脚本已经处理：
+```bash
+KB_DOCLING_URL="http://127.0.0.1:18111"
+KB_DOCLING_API_KEY=
+KB_DOCLING_TOKENIZER="D:/知识库/.local/qa-tokenizer"
+```
 
-- **`torchvision` 必须和 `torch` 同源**。CPU 版 `torch` 配 PyPI 的 `torchvision` 会在导入时报 `operator torchvision::nms does not exist`，而 Docling 只把它显示成 `Could not import module 'AutoProcessor'`，看不出真正原因。两个包都从 `download.pytorch.org/whl/cpu` 装。
-- **`parser.env` 里不能留开发机的路径**。`KB_DOCLING_TOKENIZER` 指向本机目录会让分块直接失败，Linux 上要留空（默认 `bert-base-multilingual-cased`）。
-- **端口可能被 SSH 隧道占着**。有人用 `ssh -R` 把本机 Docling 转发到服务器的同一端口时，systemd 只会反复报 `address already in use`。脚本启动前先停自己的服务再检查端口，占用时直接报错，不会留下重启循环。
+注意三个容易踩的点：
 
-Docling 模型常驻约 1.2 GiB，与 PostgreSQL、OpenSearch 同机时脚本给服务设了 `MemoryHigh=1600M`、`MemoryMax=2200M`：真跑不动时被 systemd 重启的是解析服务，不是数据库。
+- **`KB_DOCLING_TOKENIZER` 是解析主机上的路径**，不是服务器上的。worker 只把这个字符串原样放进请求，由 Docling 所在的那台机器去解析，所以填开发机的目录是对的；Linux 解析主机上则要留空（默认 `bert-base-multilingual-cased`）。
+- **隧道断了任务会排队，不会报错**。后台任务页会显示「解析服务没有在运行」的红色横幅和真实等待时长，重启隧道后队列自动继续，不需要重新上传。
+- **端口上没人监听不一定是故障**。`ss -ltnp` 显示 `sshd` 持有该端口时，说明是 `ssh -R` 转发，别急着在服务器上装一套 Docling。
 
 本地入库与分块工程。使用 Python 3.11+ 和标准库。首批源文件、文档 ID、正文与切片保存在 Git 忽略的 `.local/` 中。
 

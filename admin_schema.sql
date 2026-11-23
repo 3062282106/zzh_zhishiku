@@ -93,3 +93,17 @@ ALTER TABLE member_account ADD COLUMN IF NOT EXISTS email text;
 ALTER TABLE member_account ADD COLUMN IF NOT EXISTS kind text;
 ALTER TABLE knowledge_grant ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 CREATE INDEX IF NOT EXISTS knowledge_grant_by_library ON knowledge_grant(kb_id, member_id);
+
+-- Member lifecycle. Grant changes were already visible in the audit feed, but
+-- "who created this account / who disabled it / when was the token rotated" had
+-- nowhere to live: member_account only keeps the current state, and the token is
+-- stored as a hash, so the old token cannot be reconstructed from the row.
+CREATE TABLE IF NOT EXISTS member_event (
+    id uuid PRIMARY KEY,
+    member text NOT NULL,
+    action text NOT NULL,
+    detail text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS member_event_recent ON member_event(created_at DESC);
+

@@ -248,3 +248,10 @@ td.right{text-align:right}
   .rail{flex-direction:row;overflow:auto;border-right:0;border-bottom:1px solid var(--line)}
   .rail .new{margin:0}
 }
+
+/* 一次性令牌与接入说明：令牌很长，必须能换行，否则抽屉会被撑破 */
+.secret{display:grid;gap:8px}
+.secret code,.secret pre{margin:0;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
+  background:#f7f9fd;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12.5px;line-height:1.7;white-space:pre-wrap;word-break:break-all;color:var(--ink)}
+.rowacts{display:flex;gap:8px;justify-content:flex-end}

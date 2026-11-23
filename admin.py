@@ -4,6 +4,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+from secrets import token_urlsafe
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 import dashscope_models
+from access import token_hash
 from ingest import notion_units, split_text
 from metadata import normalize
 import search
@@ -321,6 +323,73 @@ def set_member_grants(db, member, libraries, expires_at=None):
     return {"member": member, "libraries": libraries}
 
 
+MEMBER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+MEMBER_EVENTS = {"created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌"}
+
+
+def member_event(db, member, action, detail=None):
+    db.execute("INSERT INTO member_event (id, member, action, detail) VALUES (%s,%s,%s,%s)",
+               (uuid4(), member, action, detail))
+
+
+def create_member(db, name, email=None, libraries=(), expires_at=None, kind="employee"):
+    """Create an account and return its token once.
+
+    Only the hash is stored, so the plaintext token exists exactly once — in this
+    response. There is no endpoint that can hand it out again; a lost token is
+    rotated, never recovered.
+    """
+    name = (name or "").strip()
+    if not name or len(name) > 120:
+        raise ManagementError("请填写成员姓名，不超过 120 字。")
+    email = (email or "").strip() or None
+    if email and ("@" not in email or len(email) > 200):
+        raise ManagementError("邮箱格式不正确。")
+    if expires_at is not None and expires_at.utcoffset() is None:
+        raise ManagementError("到期时间需要包含时区。")
+    token = token_urlsafe(32)
+    member = "m_" + uuid4().hex[:10]
+    with db.transaction():
+        if email and db.execute("SELECT 1 FROM member_account WHERE email=%s", (email,)).fetchone():
+            raise ManagementError("这个邮箱已经有成员了，直接给他授权即可。")
+        db.execute("""
+            INSERT INTO member_account (id, token_hash, enabled, display_name, email, kind)
+            VALUES (%s,%s,true,%s,%s,%s)
+        """, (member, token_hash(token), name, email, kind))
+        member_event(db, member, "created", name + (f" <{email}>" if email else ""))
+    if libraries:
+        set_member_grants(db, member, list(libraries), expires_at)
+    return {"id": member, "name": name, "email": email, "kind": kind, "token": token,
+            "libraries": list(libraries)}
+
+
+def reset_member_token(db, member):
+    """Issue a new token. The previous one stops working immediately."""
+    if not MEMBER_ID.fullmatch(member or ""):
+        raise ManagementError("成员标识无效。")
+    token = token_urlsafe(32)
+    with db.transaction():
+        if not db.execute("SELECT 1 FROM member_account WHERE id=%s", (member,)).fetchone():
+            raise ManagementError("找不到此成员。")
+        db.execute("UPDATE member_account SET token_hash=%s WHERE id=%s", (token_hash(token), member))
+        member_event(db, member, "token_reset")
+    return {"id": member, "token": token}
+
+
+def set_member_state(db, member, enabled):
+    if not MEMBER_ID.fullmatch(member or ""):
+        raise ManagementError("成员标识无效。")
+    with db.transaction():
+        row = db.execute("SELECT enabled FROM member_account WHERE id=%s FOR UPDATE", (member,)).fetchone()
+        if not row:
+            raise ManagementError("找不到此成员。")
+        if row[0] == enabled:
+            return {"id": member, "enabled": enabled}
+        db.execute("UPDATE member_account SET enabled=%s WHERE id=%s", (enabled, member))
+        member_event(db, member, "enabled" if enabled else "disabled")
+    return {"id": member, "enabled": enabled}
+
+
 PARSE_STATES = {"queued": "queued", "parsing": "running", "ready": "done", "failed": "failed"}
 PUBLISH_STATES = {"queued": "queued", "indexing": "running", "published": "done", "failed": "failed"}
 
@@ -393,7 +462,8 @@ def task_feed(db, library=None, days=30):
 
 
 AUDIT_KINDS = {"publish": "发布", "rollback": "回滚", "unpublish": "下架", "restore": "恢复上线",
-               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问"}
+               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问",
+               "created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌"}
 
 
 def audit_feed(db, library=None, kind=None, limit=200):
@@ -427,6 +497,13 @@ def audit_feed(db, library=None, kind=None, limit=200):
                 FROM knowledge_grant g
                 JOIN knowledge_base kb ON kb.id = g.kb_id
                 JOIN member_account m ON m.id = g.member_id
+                UNION ALL
+                -- Account lifecycle: creating, disabling and rotating a token leave no
+                -- trace in knowledge_grant, and the token itself is only stored hashed.
+                SELECT 'member', e.created_at, e.action, NULL::text, NULL::text,
+                       COALESCE(m.display_name, e.member), NULL::text, NULL::text, e.member
+                FROM member_event e
+                LEFT JOIN member_account m ON m.id = e.member
             ) feed""" + scope + """
             ORDER BY at DESC LIMIT %s
         """, [*parameters, limit]).fetchall()
