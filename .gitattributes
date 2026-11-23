@@ -1,0 +1,7 @@
+# 仓库里统一用 LF：scripts/*.sh 会被拷到 Linux 上执行，CRLF 会让 bash 报错。
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
