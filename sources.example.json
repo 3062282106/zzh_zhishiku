@@ -1,0 +1,28 @@
+{
+  "metadata_fields": {
+    "catalog": { "columns": { "product_code": "商品编号", "region": "地区" } }
+  },
+  "sources": [
+    {
+      "platform": "notion",
+      "id": "notion-page-id",
+      "title": "示例页面",
+      "url": "https://www.notion.so/notion-page-id",
+      "file": "notion.json",
+      "metadata_profile": "catalog"
+    },
+    {
+      "platform": "feishu",
+      "id": "feishu-doc-token",
+      "title": "示例飞书文档",
+      "url": "https://example.feishu.cn/docx/feishu-doc-token",
+      "file": "feishu.json",
+      "section_metadata": [
+        { "heading_path": ["适用终端"], "metadata": { "terminal": ["desktop", "mobile"] } }
+      ],
+      "sections": [
+        "heading-block-id"
+      ]
+    }
+  ]
+}
