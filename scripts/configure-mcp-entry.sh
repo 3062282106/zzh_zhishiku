@@ -3,27 +3,32 @@
 #
 # The MCP service deliberately listens on 127.0.0.1 only. This script puts nginx in
 # front of it on a non-standard port, so nothing has to touch 80/443 — which is what
-# keeps the deployment free of ICP filing. Two gates: the Alibaba Cloud security group
-# (outside) and nginx `allow` (inside), so a security group opened too wide still does
-# not expose the endpoint.
+# keeps the deployment free of ICP filing.
+#
+# Source restriction is optional. A single office already showed two different egress
+# IPs (one for SSH, one for the browser), so an allowlist turns into whack-a-mole;
+# pass `any` to drop it and let the bearer token be the only credential.
 set -euo pipefail
 
 port="${KB_MCP_ENTRY_PORT:-18443}"
 app=/opt/knowledge-kb
 envfile=/etc/knowledge-kb/api.env
 
-if [[ $# -lt 2 ]]; then
+usage() {
   cat >&2 <<'USAGE'
-用法：sudo bash scripts/configure-mcp-entry.sh <对外地址> <允许的来源 IP 或 CIDR> [...]
+用法：sudo bash scripts/configure-mcp-entry.sh <对外地址> <来源> [...]
 
-  对外地址     同事填进客户端的主机，例如 47.120.35.20
-  允许的来源   办公室出口 IP，可写多个；127.0.0.1 始终放行
+  对外地址   同事填进客户端的主机，例如 47.120.35.20
+  来源       any 表示不限制来源（只靠令牌），或者写 IP / CIDR，可以写多个
 
-例：sudo bash scripts/configure-mcp-entry.sh 47.120.35.20 58.248.185.4
+例：
+  sudo bash scripts/configure-mcp-entry.sh 47.120.35.20 any
+  sudo bash scripts/configure-mcp-entry.sh 47.120.35.20 58.248.185.4 14.23.147.186
 USAGE
   exit 1
-fi
+}
 
+[[ $# -ge 2 ]] || usage
 [[ $(id -u) == 0 ]] || { echo '需要 root。' >&2; exit 1; }
 [[ -x "$app/.venv/bin/python" && -s "$envfile" ]] || { echo '先部署后台，再配入口。' >&2; exit 1; }
 systemctl is-active --quiet knowledge-kb-mcp.service || { echo 'MCP 服务没有在运行。' >&2; exit 1; }
@@ -32,18 +37,35 @@ host="$1"
 shift
 public="http://$host:$port/mcp"
 
-allow=$'    allow 127.0.0.1;\n'
-for source in "$@"; do
-  [[ $source =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] ||
-    { echo "来源地址不合法：$source" >&2; exit 1; }
-  allow+="    allow $source;"$'\n'
-done
+open=no
+access=
+if [[ ${1-} == any ]]; then
+  [[ $# -eq 1 ]] || { echo 'any 不能和其他来源混用。' >&2; exit 1; }
+  open=yes
+  access=$'    # 不限制来源：令牌是唯一凭据，限流见 /etc/nginx/conf.d/kb-mcp-limit.conf。\n'
+else
+  access=$'    allow 127.0.0.1;\n'
+  for source in "$@"; do
+    [[ $source =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] ||
+      { echo "来源地址不合法：$source" >&2; exit 1; }
+    access+="    allow $source;"$'\n'
+  done
+  access+=$'    deny all;\n'
+fi
 
 if ! command -v nginx >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq nginx-light
 fi
+
+# 限流区域只能声明在 http 块里，所以单独放一个 conf.d 文件；nginx.conf 先 include
+# conf.d 再 include sites-enabled，顺序正好。
+cat > /etc/nginx/conf.d/kb-mcp-limit.conf <<'CONF'
+# 入口不做来源限制时，这里是唯一挡住无差别刷请求的东西。令牌猜不出来，但没人拦着
+# 扫描器每秒发几千个请求。按 IP 限速，正常客户端一分钟几十次完全够用。
+limit_req_zone $binary_remote_addr zone=kbmcp:10m rate=120r/m;
+CONF
 
 cat > /etc/nginx/sites-available/kb-mcp <<CONF
 # 同事的 MCP 入口：只把 /mcp 转给回环上的 MCP 服务，其余路径一律 404。
@@ -52,8 +74,9 @@ server {
     server_name _;
     server_tokens off;
 
-    # 第二道门。安全组是第一道；万一安全组被开成全网，这里也只认这些来源。
-$allow    deny all;
+$access
+    limit_req zone=kbmcp burst=30 nodelay;
+    limit_req_status 429;
 
     access_log /var/log/nginx/kb-mcp.log;
 
@@ -108,17 +131,27 @@ for _ in $(seq 1 40); do
 done
 [[ $status == 401 ]] || { echo "MCP 入口返回 $status，预期 401。" >&2; exit 1; }
 
-cat <<DONE
+echo
+echo "入口已就绪：$public"
+echo "控制台的「复制接入说明」会自动带上这个地址。"
+echo
+if [[ $open == yes ]]; then
+  cat <<DONE
+来源不限制。还差一步，只能在阿里云控制台做：
+  ECS → 安全组 → 入方向 → 把 $port/$port 那条规则的「授权对象」改成 0.0.0.0/0
 
-入口已就绪：$public
-控制台的「复制接入说明」会自动带上这个地址。
-
+改完任何人任何网络都能连，凭令牌区分身份。想改回白名单就重跑本脚本并列出 IP。
+DONE
+else
+  cat <<DONE
+来源限制在：$(printf '%s ' "$@")
 还差一步，只能在阿里云控制台做：
   ECS → 安全组 → 入方向 → 手动添加
     协议类型  自定义 TCP
     端口范围  $port/$port
-    授权对象  $(printf '%s' "$*" | cut -d' ' -f1)/32
-    描述      MCP 入口（办公室出口 IP）
+    授权对象  上面那些 IP（多个就各加一条）
+    描述      MCP 入口
 
-公司出口 IP 变了就改两处：安全组的授权对象，和 /etc/nginx/sites-available/kb-mcp 里的 allow。
+来源 IP 变了就重跑本脚本，并把安全组里旧的规则改掉。
 DONE
+fi
