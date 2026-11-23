@@ -315,7 +315,7 @@ async function onPublished(info) {
               <b>{{ probe.member }} 无权访问「{{ probe.library }}」</b>
               <p>未返回任何文档内容。可切换模拟身份，或到成员与权限里调整授权。</p>
               <div style="margin-top:10px">
-                <router-link class="btn sm" to="/members">管理成员权限</router-link>
+                <router-link class="btn sm" :to="{ name: 'members' }">管理成员权限</router-link>
               </div>
             </div>
             <EmptyState v-else-if="!probe.hits.length" title="没有命中分块" note="换个问法，或确认这一版是否包含相关内容。" />

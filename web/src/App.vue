@@ -15,12 +15,9 @@ const NAV = [
     { key: "kb", label: "知识库", to: "/kb" },
     { key: "sources", label: "同步来源", to: "/sources" },
   ] },
-  { title: "访问管理", items: [
-    { key: "members", label: "成员与权限", to: "/members" },
-  ] },
 ];
 const TITLES = {
-  kb: "知识库", doc: "知识库", sources: "同步来源", members: "成员与权限",
+  kb: "知识库", doc: "知识库", sources: "同步来源",
 };
 
 const route = useRoute();
@@ -121,7 +118,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
       </nav>
       <div class="side-foot">
         <router-link class="btn link" to="/operations" :class="{ 'operations-active': route.meta.operations }">运维管理</router-link>
-        <button class="btn link" style="margin-top:8px" @click="logout">退出登录</button>
+        <button class="btn link sign-out" @click="logout">退出登录</button>
       </div>
     </aside>
 

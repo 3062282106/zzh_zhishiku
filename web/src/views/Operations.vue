@@ -1,5 +1,6 @@
 <script setup>
 const pages = [
+  ["members", "成员与权限"],
   ["tasks", "处理任务"], ["retrieval", "检索记录"], ["audit", "操作记录"], ["settings", "设置"],
 ];
 </script>
