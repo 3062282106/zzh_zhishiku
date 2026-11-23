@@ -28,6 +28,25 @@ python scripts/deploy-admin-ssh.py <ECS_IP> --tunnel
 
 回到知识库 ECS 后执行 `sudo bash scripts/configure-parser-worker.sh`，按终端提示输入解析服务根地址和密钥。密钥由脚本写入 `/etc/knowledge-kb/parser.env`。脚本启动 `knowledge-kb-parser` 和 `knowledge-kb-publisher`，发布 worker 读取 API 已有的检索和百炼配置。将获批的文档传入后台，草稿就绪后核对预览并提交发布。后台显示处理状态和失败原因，通过 `systemctl is-active knowledge-kb-parser knowledge-kb-publisher` 检查服务。原件与解析结果随 PostgreSQL 数据进入现有备份范围。
 
+### 在同一台 ECS 上装解析服务（没有 Docker 时）
+
+ECS 上没有 Docker 时，`scripts/configure-docling-serve.sh` 用独立虚拟环境把 Docling Serve 装在 `/opt/docling`，只监听回环地址，不进入 API 的 `/opt/knowledge-kb/.venv`，所以后台重新部署不必重下 torch：
+
+```bash
+sudo bash scripts/configure-docling-serve.sh          # 默认 127.0.0.1:18112
+sudo KB_DOCLING_PORT=18113 bash scripts/configure-docling-serve.sh   # 换端口
+```
+
+脚本会补 2 GiB swap、装 `torch`/`torchvision`（CPU wheel）、`docling-serve`、`onnxruntime`，写 `docling-serve.service`，并把 `parser.env` 的 `KB_DOCLING_URL` 指向该端口。装完用后台传一份扫描件验证：任务从「等待中」走到「已完成」，预览里能看到 OCR 出来的正文。模型约 509 MiB，第一次解析时从 `HF_ENDPOINT=https://hf-mirror.com` 下载并缓存在 `/opt/docling/.cache`，之后每次解析不再下载。
+
+三个会让它「装好却起不来」的坑，脚本已经处理：
+
+- **`torchvision` 必须和 `torch` 同源**。CPU 版 `torch` 配 PyPI 的 `torchvision` 会在导入时报 `operator torchvision::nms does not exist`，而 Docling 只把它显示成 `Could not import module 'AutoProcessor'`，看不出真正原因。两个包都从 `download.pytorch.org/whl/cpu` 装。
+- **`parser.env` 里不能留开发机的路径**。`KB_DOCLING_TOKENIZER` 指向本机目录会让分块直接失败，Linux 上要留空（默认 `bert-base-multilingual-cased`）。
+- **端口可能被 SSH 隧道占着**。有人用 `ssh -R` 把本机 Docling 转发到服务器的同一端口时，systemd 只会反复报 `address already in use`。脚本启动前先停自己的服务再检查端口，占用时直接报错，不会留下重启循环。
+
+Docling 模型常驻约 1.2 GiB，与 PostgreSQL、OpenSearch 同机时脚本给服务设了 `MemoryHigh=1600M`、`MemoryMax=2200M`：真跑不动时被 systemd 重启的是解析服务，不是数据库。
+
 本地入库与分块工程。使用 Python 3.11+ 和标准库。首批源文件、文档 ID、正文与切片保存在 Git 忽略的 `.local/` 中。
 
 ## 生成并核对切片
