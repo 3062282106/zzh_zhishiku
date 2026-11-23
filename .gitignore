@@ -1,0 +1,23 @@
+# 本地运行数据与凭证：数据库密码、QA 截图、下载的解析环境
+.local/
+
+# 工具与助手的工作目录，不属于产品代码
+.codex/
+.workbuddy-ai/
+
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+
+# 前端依赖由 npm ci 还原；dist 要提交，服务器上没有 Node
+web/node_modules/
+
+# 部署产物
+scripts/knowledge-admin.tar.gz
+
+# 来源不明的临时二进制文件
+v1.txt
+v2.txt
