@@ -14,10 +14,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
 
 from access import VISIBLE, connect, is_member_web_token, member_web_identity, reader_digest, token_hash
-from admin import (ManagementError, activate, admin_directory, audit_feed, close_session, create_admin,
-                   create_member, documents, libraries, member_directory, migrate, open_member_web_session, open_session, preview,
+from admin import (ManagementError, WebLoginError, access_contact_url, activate, admin_directory, audit_feed,
+                   close_session, create_admin, create_member, documents, issue_member_web_setup, libraries,
+                   member_directory, migrate, open_member_web_session, open_session, preview,
                    probe, reset_member_token, resolve_session, retrieval_feed, set_admin_password, set_admin_state,
-                   set_availability, set_member_grants, set_member_state, set_owner, task_feed, upload,
+                   set_access_contact_url, set_availability, set_member_grants, set_member_state, set_owner, task_feed, upload,
                    versions)
 from feishu_source import bind_feishu, fetch_feishu_section
 from docling_parser import MAX_FILE, ParseError
@@ -104,6 +105,19 @@ class LibraryRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
     password: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+
+
+class ConsoleLoginRequest(LoginRequest):
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    setup_code: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)] | None = None
+
+
+class MemberWebSetup(BaseModel):
+    email: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] | None = None
+
+
+class AccessContact(BaseModel):
+    url: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)]
 
 
 class AdminCreate(BaseModel):
@@ -205,7 +219,7 @@ def router(hybrid):
                 raise HTTPException(401, str(error)) from None
 
     @routes.post("/v1/session/login")
-    def console_login(payload: LoginRequest, response: Response):
+    def console_login(payload: ConsoleLoginRequest, response: Response):
         key = payload.username.lower()
         if _throttled(key):
             raise HTTPException(429, "尝试次数太多，请 5 分钟后再试。")
@@ -213,13 +227,26 @@ def router(hybrid):
         with connect() as db:
             migrate(db)
             try:
+                if "@" in payload.username:
+                    return open_member_web_session(db, payload.username, payload.password, payload.setup_code)
                 return {**open_session(db, payload.username, payload.password), "role": "admin"}
-            except ManagementError:
-                try:
-                    return open_member_web_session(db, payload.username, payload.password)
-                except ManagementError:
+            except WebLoginError as error:
+                if error.status in (401, 403):
                     _record_failure(key)
-                    raise HTTPException(401, "账号或凭据不正确。") from None
+                detail = {"code": error.code, "message": str(error)} if error.code else str(error)
+                raise HTTPException(error.status, detail, headers={"Cache-Control": "no-store"}) from None
+            except ManagementError as error:
+                if "@" in payload.username:
+                    raise HTTPException(422, str(error)) from None
+                _record_failure(key)
+                raise HTTPException(401, "账号或密码不正确。") from None
+
+    @routes.get("/v1/session/access-contact")
+    def sign_in_contact(response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db:
+            migrate(db)
+            return {"url": access_contact_url(db)}
 
     @routes.get("/v1/session/me")
     def console_me(response: Response, token: Annotated[str, Depends(reader_identity)]):
@@ -315,14 +342,15 @@ def router(hybrid):
             return member_directory(db)
 
     @control.post("/members", status_code=201)
-    def add_member(payload: MemberCreate):
+    def add_member(payload: MemberCreate, response: Response):
         if payload.kind not in ("employee", "guest"):
             raise HTTPException(422, "身份类型只能是 employee 或 guest。")
         try:
+            response.headers["Cache-Control"] = "no-store"
             with connect() as db:
                 migrate(db)
                 return create_member(db, payload.name, payload.email, payload.libraries,
-                                     payload.expires_at, payload.kind)
+                                     payload.expires_at, payload.kind, enable_web=True)
         except ManagementError as error:
             raise HTTPException(422, str(error)) from None
 
@@ -334,6 +362,18 @@ def router(hybrid):
                 return reset_member_token(db, member)
         except ManagementError as error:
             raise HTTPException(404, str(error)) from None
+
+    @control.post("/members/{member}/web-setup")
+    def web_setup(member: str, payload: MemberWebSetup, response: Response,
+                  identity: Annotated[dict, Depends(admin_identity)]):
+        if identity["role"] != "admin":
+            raise HTTPException(403, "请使用管理员账号管理网页登录。")
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            with connect() as db:
+                return issue_member_web_setup(db, member, payload.email)
+        except ManagementError as error:
+            raise HTTPException(422, str(error)) from None
 
     @control.put("/members/{member}/state")
     def switch_member(member: str, payload: MemberState):
@@ -349,7 +389,19 @@ def router(hybrid):
         # The address colleagues put in their MCP client. It is deployment-specific
         # (tunnel, LAN entry, or a proxied hostname), so it lives in api.env rather
         # than being baked into the console bundle.
-        return {"mcp_url": os.environ.get("KB_MCP_PUBLIC_URL", "").strip()}
+        with connect() as db:
+            migrate(db)
+            return {"mcp_url": os.environ.get("KB_MCP_PUBLIC_URL", "").strip(), "access_contact_url": access_contact_url(db)}
+
+    @control.put("/settings/access-contact")
+    def configure_contact(payload: AccessContact, identity: Annotated[dict, Depends(admin_identity)]):
+        if identity["role"] != "admin":
+            raise HTTPException(403, "请使用管理员账号修改申请入口。")
+        try:
+            with connect() as db:
+                return {"url": set_access_contact_url(db, payload.url)}
+        except ManagementError as error:
+            raise HTTPException(422, str(error)) from None
 
     @control.post("/members/{member}/grants")
     def replace_grants(member: str, payload: MemberGrantRequest):

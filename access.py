@@ -90,7 +90,8 @@ def member_web_identity(db, token):
     return db.execute("""
         SELECT m.id, COALESCE(m.display_name, m.id), m.token_hash
         FROM member_web_session s JOIN member_account m ON m.id=s.member_id
-        WHERE s.token_hash=%s AND s.expires_at > now() AND m.enabled
+        JOIN member_web_credential w ON w.member_id=m.id
+        WHERE s.token_hash=%s AND s.expires_at > now() AND m.enabled AND w.password_hash IS NOT NULL
     """, (token_hash(token),)).fetchone()
 
 

@@ -150,3 +150,16 @@ CREATE TABLE IF NOT EXISTS member_web_session (
     expires_at timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS member_web_session_member ON member_web_session(member_id);
+CREATE TABLE IF NOT EXISTS member_web_credential (
+    member_id text PRIMARY KEY REFERENCES member_account(id) ON DELETE CASCADE,
+    email text NOT NULL UNIQUE,
+    password_hash text,
+    setup_hash text,
+    setup_expires_at timestamptz,
+    CHECK ((password_hash IS NOT NULL AND setup_hash IS NULL AND setup_expires_at IS NULL)
+        OR (password_hash IS NULL AND setup_hash IS NOT NULL AND setup_expires_at IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS console_setting (
+    key text PRIMARY KEY,
+    value text NOT NULL
+);

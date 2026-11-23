@@ -15,11 +15,13 @@ const createOpen = ref(false);
 const busy = ref(false);
 const chosen = ref([]);
 const expires = ref("");
+const webEmail = ref("");
 
 const form = ref({ name: "", email: "", libraries: [], expires: "" });
 // The plaintext token exists only in this object: the server stores a hash and
 // cannot return it again, so closing this drawer means it is gone for good.
 const issued = ref(null);
+const WEB_STATUS = { not_enabled: "未开通", active: "已设置密码", pending: "待设置密码", expired: "设置链接已过期" };
 
 const rows = computed(() => {
   const needle = q.value.trim().toLowerCase();
@@ -39,6 +41,7 @@ onMounted(() => {
 
 function openMember(item) {
   member.value = item;
+  webEmail.value = item.email || "";
   chosen.value = activeGrants(item).map((grant) => grant.library);
   const first = activeGrants(item)[0];
   expires.value = toLocalInput(first ? first.expires_at : "");
@@ -117,6 +120,36 @@ function rotate() {
   });
 }
 
+function configureWeb() {
+  const target = member.value;
+  const email = webEmail.value.trim();
+  if (!email) return toastError("请先填写成员邮箱。");
+  const issue = async () => {
+    if (busy.value) return;
+    busy.value = true;
+    try {
+      const setup = await api("/members/" + enc(target.id) + "/web-setup", { method: "POST", body: { email } });
+      member.value = null;
+      issued.value = { ...target, email: setup.email, web_setup: setup };
+      await loadMembers();
+    } finally {
+      busy.value = false;
+    }
+  };
+  if (target.web_status === "active") {
+    confirmBox({ title: "重置 " + target.name + " 的网页密码？", note: "旧密码和已登录的网页会话会立即失效。",
+      label: "重置密码", danger: true, action: issue });
+  } else {
+    issue().catch(fail);
+  }
+}
+
+function setupLink(setup) {
+  const url = new URL("/admin/kb", window.location.origin);
+  url.hash = new URLSearchParams({ email: setup.email, setup: setup.setup_code }).toString();
+  return url.href;
+}
+
 async function switchState(target, enabled) {
   try {
     await api("/members/" + enc(target.id) + "/state", { method: "PUT", body: { enabled } });
@@ -155,7 +188,7 @@ function guideText(person, token) {
     "给：" + (person.name || person.id),
     "",
     "网页查询：" + window.location.origin + "/admin/",
-    "网页登录填写成员 ID「" + person.id + "」和下面的令牌。",
+    "网页使用你的邮箱和自行设置的密码登录。",
     "",
     "一、在客户端里新建一个自定义连接器（或 MCP 服务器）",
     "二、传输类型选 HTTP",
@@ -281,9 +314,19 @@ async function copy(text, label) {
     </div>
 
     <div class="field">
-      <label>账号操作</label>
+      <label>网页登录 · {{ WEB_STATUS[member.web_status] || '未开通' }}</label>
+      <input v-if="!member.email" v-model="webEmail" type="email" placeholder="成员邮箱" aria-label="用于网页登录的邮箱" maxlength="200">
+      <div v-if="member.enabled" class="rowacts" style="justify-content:flex-start">
+        <button class="btn sm" :disabled="busy" @click="configureWeb">
+          {{ member.web_status === 'active' ? '重置网页密码' : member.web_status === 'not_enabled' ? '开通网页登录' : '重新生成设置链接' }}
+        </button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>连接器与账号状态</label>
       <div class="rowacts" style="justify-content:flex-start">
-        <button class="btn sm" @click="rotate">重置令牌</button>
+        <button class="btn sm" @click="rotate">重置 MCP 令牌</button>
         <button v-if="member.enabled" class="btn sm danger" @click="switchState(member, false)">停用账号</button>
         <button v-else class="btn sm" @click="switchState(member, true)">启用账号</button>
       </div>
@@ -301,13 +344,13 @@ async function copy(text, label) {
     </template>
   </Drawer>
 
-  <Drawer v-if="createOpen" title="新建成员" subtitle="填名字、勾上能看的库，生成令牌" @close="createOpen = false">
+  <Drawer v-if="createOpen" title="新建成员" @close="createOpen = false">
     <div class="field">
       <label>姓名</label>
       <input v-model="form.name" type="text" placeholder="例如：张三" maxlength="120">
     </div>
     <div class="field">
-      <label>邮箱（可选，方便你认人）</label>
+      <label>成员邮箱（用于网页登录）</label>
       <input v-model="form.email" type="email" placeholder="name@company.com" maxlength="200">
     </div>
     <div class="field">
@@ -324,14 +367,13 @@ async function copy(text, label) {
       <label>访问到期时间（留空表示长期）</label>
       <input v-model="form.expires" type="datetime-local">
     </div>
-    <div class="note">创建后令牌只显示一次，请当场复制发给他。之后只能重置，无法再查看。</div>
     <template #footer>
       <button class="btn" @click="createOpen = false">取消</button>
-      <button class="btn primary" :disabled="busy" @click="create">创建并生成令牌</button>
+      <button class="btn primary" :disabled="busy" @click="create">创建成员</button>
     </template>
   </Drawer>
 
-  <Drawer v-if="issued" title="令牌已生成" subtitle="只显示这一次，请当场发给对方"
+  <Drawer v-if="issued" :title="issued.web_setup ? '网页登录设置' : 'MCP 令牌已生成'"
           :autofocus="false" @close="issued = null">
     <div class="block">
       <div class="k">成员</div>
@@ -339,8 +381,20 @@ async function copy(text, label) {
       <div class="k">成员 ID</div><div class="mono">{{ issued.id }}</div>
     </div>
 
-    <div class="field">
-      <label>个人令牌</label>
+    <div v-if="issued.web_setup" class="field">
+      <label>一次性设置凭证</label>
+      <div class="secret">
+        <code>{{ issued.web_setup.setup_code }}</code>
+        <div class="note">24 小时内有效，请私发给该成员。</div>
+        <div class="rowacts" style="justify-content:flex-start">
+          <button class="btn sm primary" @click="copy(setupLink(issued.web_setup), '设置链接')">复制设置链接</button>
+          <button class="btn sm" @click="copy(issued.web_setup.setup_code, '设置码')">复制设置码</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="issued.token" class="field">
+      <label>MCP 令牌</label>
       <div class="secret">
         <code>{{ issued.token }}</code>
         <div class="rowacts" style="justify-content:flex-start">
@@ -349,13 +403,13 @@ async function copy(text, label) {
       </div>
     </div>
 
-    <div v-if="!store.settings.mcp_url" class="errbox" style="margin:0">
+    <div v-if="issued.token && !store.settings.mcp_url" class="errbox" style="margin:0">
       <b>还没配置对外地址</b>
       <p>服务器 api.env 里的 KB_MCP_PUBLIC_URL 没设置，下面的接入说明里地址是空的。配好之后重开这个窗口再复制。</p>
     </div>
 
-    <div class="field">
-      <label>发给他的接入说明（可直接复制）</label>
+    <div v-if="issued.token" class="field">
+      <label>MCP 接入说明</label>
       <div class="secret">
         <pre>{{ guideText(issued, issued.token) }}</pre>
         <div class="rowacts" style="justify-content:flex-start">
@@ -363,8 +417,6 @@ async function copy(text, label) {
         </div>
       </div>
     </div>
-
-    <div class="note">关掉这个窗口后就看不到这串令牌了。对方弄丢了就回来点「重置令牌」。</div>
 
     <template #footer>
       <button class="btn primary" @click="issued = null">我已复制，关闭</button>

@@ -1,13 +1,34 @@
 <script setup>
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { api } from "../api";
 import PageHead from "../components/PageHead.vue";
-import { store, loadDocs, defaultLibrary } from "../store";
+import { store, loadDocs, loadSettings, defaultLibrary } from "../store";
+import { fail, toast } from "../toast";
 
 const pending = computed(() =>
   store.tasks.filter((task) => task.status === "running" || task.status === "queued").length);
+const contact = ref("");
+const saving = ref(false);
+
+watch(() => store.settings.access_contact_url, (url) => { contact.value = url || ""; }, { immediate: true });
+
+async function saveContact() {
+  if (saving.value) return;
+  saving.value = true;
+  try {
+    const result = await api("/settings/access-contact", { method: "PUT", body: { url: contact.value.trim() } });
+    store.settings.access_contact_url = result.url;
+    toast("申请入口已保存。");
+  } catch (error) {
+    fail(error);
+  } finally {
+    saving.value = false;
+  }
+}
 
 // Landing here directly (a bookmark) must still show a real document count.
 onMounted(() => {
+  loadSettings().catch(fail);
   const id = store.activeLibrary || defaultLibrary();
   if (id) loadDocs(id).catch(() => {});
 });
@@ -16,6 +37,17 @@ onMounted(() => {
 <template>
   <div class="wrap">
     <PageHead title="设置" subtitle="企业设置 / Agent 接入" />
+
+    <div class="card pad" style="margin-bottom:16px">
+      <form @submit.prevent="saveContact">
+        <div class="field">
+          <label for="access-contact">申请开通 · 飞书私聊链接</label>
+          <input id="access-contact" v-model="contact" type="url" required maxlength="2048"
+                 placeholder="https://applink.feishu.cn/client/chat/open?...">
+        </div>
+        <button class="btn primary" :disabled="saving">保存链接</button>
+      </form>
+    </div>
 
     <div class="card">
       <div class="pane-head"><h2>查询入口</h2></div>

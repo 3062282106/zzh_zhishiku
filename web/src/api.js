@@ -1,14 +1,16 @@
 import { auth, clearToken } from "./auth";
 
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, code) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
 function explain(data, status) {
   if (data && typeof data.detail === "string") return data.detail;
+  if (data?.detail && typeof data.detail.message === "string") return data.detail.message;
   if (status === 401) return "登录已过期，请重新登录。";
   if (status === 404) return "找不到对象，可能已被删除，请刷新后重试。";
   if (status === 409) return "数据已变化，请刷新后重试。";
@@ -48,7 +50,7 @@ async function request(path, options = {}) {
     const detail = data && typeof data.detail === "string" ? data.detail : "登录已过期，请重新登录。";
     throw new ApiError(detail, 401);
   }
-  if (!response.ok) throw new ApiError(explain(data, response.status), response.status);
+  if (!response.ok) throw new ApiError(explain(data, response.status), response.status, data?.detail?.code);
   return data;
 }
 

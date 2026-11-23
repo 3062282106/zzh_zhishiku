@@ -9,8 +9,10 @@ from pathlib import Path
 import re
 from secrets import token_bytes, token_urlsafe
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit
 from uuid import uuid4
 
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -33,6 +35,13 @@ VISIBILITY_STATUS = """
 
 class ManagementError(ValueError):
     pass
+
+
+class WebLoginError(ManagementError):
+    def __init__(self, status, message, code=None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 _migrated = False
@@ -189,21 +198,65 @@ def close_session(db, token):
     db.execute("DELETE FROM admin_session WHERE token_hash=%s", (token_hash(token),))
 
 
-def open_member_web_session(db, identifier, credential):
+def open_member_web_session(db, email, password, setup_code=None):
     with db.transaction():
         row = db.execute("""
-            SELECT id, COALESCE(display_name, id) FROM member_account
-            WHERE id=%s AND token_hash=%s AND enabled FOR UPDATE
-        """, (identifier, token_hash(credential))).fetchone()
+            SELECT m.id, COALESCE(m.display_name, m.id)
+            FROM member_web_credential w JOIN member_account m ON m.id=w.member_id
+            WHERE w.email=%s AND m.enabled FOR UPDATE OF m
+        """, (email.lower(),)).fetchone()
         if row is None:
-            raise ManagementError("账号或凭据不正确。")
+            raise WebLoginError(403, "没有权限，请找管理员开通权限。")
+        member, name = row
+        password_hash, setup_hash, setup_valid = db.execute("""
+            SELECT password_hash, setup_hash, setup_expires_at > clock_timestamp()
+            FROM member_web_credential WHERE member_id=%s
+        """, (member,)).fetchone()
+        if password_hash:
+            if setup_code:
+                raise WebLoginError(409, "设置凭证已使用，请返回登录。", "setup_used")
+            if not verify_password(password, password_hash):
+                raise WebLoginError(401, "密码错误，请找管理员重置密码。")
+        else:
+            if not setup_valid:
+                raise WebLoginError(403, "设置凭证已过期，请找管理员重新发放。", "setup_expired")
+            if not setup_code:
+                raise WebLoginError(428, "首次登录或重置后，请使用管理员发给你的设置凭证。", "setup_required")
+            if not compare_digest(token_hash(setup_code), setup_hash):
+                raise WebLoginError(401, "设置凭证错误，请核对管理员发给你的链接或设置码。")
+            _check_password(password)
+            db.execute("""
+                UPDATE member_web_credential SET password_hash=%s, setup_hash=NULL, setup_expires_at=NULL
+                WHERE member_id=%s
+            """, (hash_password(password), member))
         token = "web_" + token_urlsafe(32)
-        db.execute("DELETE FROM member_web_session WHERE member_id=%s AND expires_at <= now()", (row[0],))
+        db.execute("DELETE FROM member_web_session WHERE member_id=%s AND expires_at <= now()", (member,))
         db.execute("""
             INSERT INTO member_web_session (token_hash, member_id, expires_at)
             VALUES (%s,%s,now()+interval '24 hours')
-        """, (token_hash(token), row[0]))
-    return {"token": token, "id": row[0], "name": row[1], "role": "member"}
+        """, (token_hash(token), member))
+    return {"token": token, "id": member, "name": name, "role": "member"}
+
+
+def access_contact_url(db):
+    row = db.execute("SELECT value FROM console_setting WHERE key='access_contact_url'").fetchone()
+    return row[0] if row else ""
+
+
+def set_access_contact_url(db, url):
+    try:
+        link = urlsplit(url)
+        if (link.scheme != "https" or link.netloc != "applink.feishu.cn" or
+            link.path != "/client/chat/open" or not link.query or
+            any(character.isspace() for character in url)):
+            raise ValueError
+    except ValueError:
+        raise ManagementError("请填写以 https://applink.feishu.cn/client/chat/open 开头的飞书单聊链接。") from None
+    db.execute("""
+        INSERT INTO console_setting (key, value) VALUES ('access_contact_url',%s)
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+    """, (url,))
+    return url
 
 
 def libraries(db):
@@ -440,6 +493,9 @@ def member_directory(db):
         return cur.execute("""
             SELECT m.id, COALESCE(m.display_name, m.id) AS name, m.email,
                    COALESCE(m.kind, 'employee') AS kind, m.enabled,
+                   CASE WHEN w.member_id IS NULL THEN 'not_enabled'
+                        WHEN w.password_hash IS NOT NULL THEN 'active'
+                        WHEN w.setup_expires_at <= now() THEN 'expired' ELSE 'pending' END AS web_status,
                    COALESCE(json_agg(json_build_object(
                        'library', g.kb_id, 'name', kb.name,
                        'expires_at', g.expires_at, 'revoked_at', g.revoked_at
@@ -447,7 +503,8 @@ def member_directory(db):
             FROM member_account m
             LEFT JOIN knowledge_grant g ON g.member_id = m.id
             LEFT JOIN knowledge_base kb ON kb.id = g.kb_id
-            GROUP BY m.id
+            LEFT JOIN member_web_credential w ON w.member_id=m.id
+            GROUP BY m.id, w.member_id, w.password_hash, w.setup_expires_at
             ORDER BY name
         """).fetchall()
 
@@ -477,7 +534,8 @@ def set_member_grants(db, member, libraries, expires_at=None):
 
 
 MEMBER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-MEMBER_EVENTS = {"created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌"}
+MEMBER_EVENTS = {"created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌",
+                 "web_opened": "开通网页登录", "web_password_reset": "重置网页密码"}
 
 
 def member_event(db, member, action, detail=None):
@@ -485,7 +543,41 @@ def member_event(db, member, action, detail=None):
                (uuid4(), member, action, detail))
 
 
-def create_member(db, name, email=None, libraries=(), expires_at=None, kind="employee"):
+def normalize_member_email(value):
+    email = (value or "").strip().lower()
+    if not email or len(email) > 200 or not re.fullmatch(r"[^\s@]+@[^\s@]+", email):
+        raise ManagementError("请填写有效的邮箱。")
+    return email
+
+
+def issue_member_web_setup(db, member, email=None):
+    with db.transaction():
+        row = db.execute("SELECT email,enabled FROM member_account WHERE id=%s FOR UPDATE", (member,)).fetchone()
+        if row is None or not row[1]:
+            raise ManagementError("找不到已启用的成员。")
+        email = normalize_member_email(row[0] or email)
+        code = token_urlsafe(18)
+        existing = db.execute("SELECT 1 FROM member_web_credential WHERE member_id=%s", (member,)).fetchone()
+        if db.execute("SELECT 1 FROM member_account WHERE lower(email)=%s AND id<>%s", (email, member)).fetchone():
+            raise ManagementError("这个邮箱已绑定其他成员。")
+        db.execute("UPDATE member_account SET email=%s WHERE id=%s", (email, member))
+        try:
+            with db.transaction():
+                (expires_at,) = db.execute("""
+                    INSERT INTO member_web_credential (member_id,email,setup_hash,setup_expires_at)
+                    VALUES (%s,%s,%s,clock_timestamp()+interval '24 hours')
+                    ON CONFLICT (member_id) DO UPDATE SET email=EXCLUDED.email, password_hash=NULL,
+                        setup_hash=EXCLUDED.setup_hash, setup_expires_at=EXCLUDED.setup_expires_at
+                    RETURNING setup_expires_at
+                """, (member, email, token_hash(code))).fetchone()
+        except UniqueViolation:
+            raise ManagementError("这个邮箱已绑定其他成员。") from None
+        db.execute("DELETE FROM member_web_session WHERE member_id=%s", (member,))
+        member_event(db, member, "web_password_reset" if existing else "web_opened")
+    return {"email": email, "setup_code": code, "expires_at": expires_at}
+
+
+def create_member(db, name, email=None, libraries=(), expires_at=None, kind="employee", *, enable_web=False):
     """Create an account and return its token once.
 
     Only the hash is stored, so the plaintext token exists exactly once — in this
@@ -495,25 +587,24 @@ def create_member(db, name, email=None, libraries=(), expires_at=None, kind="emp
     name = (name or "").strip()
     if not name or len(name) > 120:
         raise ManagementError("请填写成员姓名，不超过 120 字。")
-    email = (email or "").strip() or None
-    if email and ("@" not in email or len(email) > 200):
-        raise ManagementError("邮箱格式不正确。")
+    email = normalize_member_email(email) if (email or "").strip() else None
     if expires_at is not None and expires_at.utcoffset() is None:
         raise ManagementError("到期时间需要包含时区。")
     token = token_urlsafe(32)
     member = "m_" + uuid4().hex[:10]
     with db.transaction():
-        if email and db.execute("SELECT 1 FROM member_account WHERE email=%s", (email,)).fetchone():
+        if email and db.execute("SELECT 1 FROM member_account WHERE lower(email)=%s", (email,)).fetchone():
             raise ManagementError("这个邮箱已经有成员了，直接给他授权即可。")
         db.execute("""
             INSERT INTO member_account (id, token_hash, enabled, display_name, email, kind)
             VALUES (%s,%s,true,%s,%s,%s)
         """, (member, token_hash(token), name, email, kind))
         member_event(db, member, "created", name + (f" <{email}>" if email else ""))
-    if libraries:
-        set_member_grants(db, member, list(libraries), expires_at)
+        if libraries:
+            set_member_grants(db, member, list(libraries), expires_at)
+        web_setup = issue_member_web_setup(db, member) if email and enable_web else None
     return {"id": member, "name": name, "email": email, "kind": kind, "token": token,
-            "libraries": list(libraries)}
+            "libraries": list(libraries), "web_setup": web_setup}
 
 
 def reset_member_token(db, member):
@@ -524,7 +615,6 @@ def reset_member_token(db, member):
     with db.transaction():
         if not db.execute("UPDATE member_account SET token_hash=%s WHERE id=%s", (token_hash(token), member)).rowcount:
             raise ManagementError("找不到此成员。")
-        db.execute("DELETE FROM member_web_session WHERE member_id=%s", (member,))
         member_event(db, member, "token_reset")
     return {"id": member, "token": token}
 
@@ -617,8 +707,7 @@ def task_feed(db, library=None, days=30):
 
 
 AUDIT_KINDS = {"publish": "发布", "rollback": "回滚", "unpublish": "下架", "restore": "恢复上线",
-               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问",
-               "created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌"}
+               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问", **MEMBER_EVENTS}
 
 
 def retrieval_feed(db, *, days, member, library, status, before, limit):

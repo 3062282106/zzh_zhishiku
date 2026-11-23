@@ -13,6 +13,7 @@ const row = ref(null);
 const KINDS = [
   ["", "全部操作"], ["publish", "发布"], ["rollback", "回滚"], ["unpublish", "下架"],
   ["restore", "恢复上线"], ["schedule", "调整有效期"], ["grant", "授权"], ["revoke", "撤销访问"],
+  ["web_opened", "开通网页登录"], ["web_password_reset", "重置网页密码"],
 ];
 
 const rows = computed(() => store.audit.filter((item) => !kind.value || item.action === kind.value));
