@@ -5,3 +5,6 @@
 *.sql text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
+
+# 构建产物按原样入库：否则每次 npm run build 都会因换行符显示为已修改
+web/dist/** -text
