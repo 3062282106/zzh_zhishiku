@@ -99,6 +99,14 @@ if ! grep -q '^KB_ADMIN_TOKEN=' "$envfile"; then
   chmod 0600 "$envfile"
   printf '\nKB_ADMIN_TOKEN=%s\n' "$("$app/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(32))')" >> "$envfile"
 fi
+# The console logs in with a username and password now. Seed one on the first deploy
+# only: re-seeding on later deploys would silently reset a password someone changed.
+if ! grep -q '^KB_ADMIN_PASSWORD=' "$envfile"; then
+  chmod 0600 "$envfile"
+  printf 'KB_ADMIN_USER=admin\nKB_ADMIN_PASSWORD=%s\n' \
+    "$("$app/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(12))')" >> "$envfile"
+  echo '已生成初始管理员 admin，密码在 /etc/knowledge-kb/api.env 的 KB_ADMIN_PASSWORD。'
+fi
 systemctl restart knowledge-kb-api.service knowledge-kb-mcp.service
 curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18081/healthz
 printf '\n'

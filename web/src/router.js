@@ -11,6 +11,7 @@ export const router = createRouter({
     { path: "/sources/:libraryId?", name: "sources", component: () => import("./views/Sources.vue") },
     { path: "/tasks", name: "tasks", component: () => import("./views/Tasks.vue") },
     { path: "/members", name: "members", component: () => import("./views/Members.vue") },
+    { path: "/administrators", name: "administrators", component: () => import("./views/Administrators.vue") },
     { path: "/audit", name: "audit", component: () => import("./views/Audit.vue") },
     { path: "/settings", name: "settings", component: () => import("./views/Settings.vue") },
     { path: "/:pathMatch(.*)*", redirect: "/kb" },

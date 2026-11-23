@@ -12,7 +12,7 @@ function read() {
   }
 }
 
-export const auth = reactive({ token: read() });
+export const auth = reactive({ token: read(), me: null });
 
 export function setToken(value) {
   auth.token = value || "";
@@ -24,6 +24,12 @@ export function setToken(value) {
   }
 }
 
+/** Who is logged in, so the shell can show a name instead of a generic label. */
+export function setIdentity(value) {
+  auth.me = value || null;
+}
+
 export function clearToken() {
   setToken("");
+  setIdentity(null);
 }

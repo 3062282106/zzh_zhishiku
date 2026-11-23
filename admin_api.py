@@ -3,6 +3,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 from secrets import compare_digest
+from time import monotonic
 from typing import Annotated
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -13,9 +14,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
 
 from access import VISIBLE, connect, token_hash
-from admin import (ManagementError, activate, audit_feed, create_member, documents, libraries, member_directory,
-                   migrate, preview, probe, reset_member_token, set_availability, set_member_grants,
-                   set_member_state, set_owner, task_feed, upload, versions)
+from admin import (ManagementError, activate, admin_directory, audit_feed, close_session, create_admin,
+                   create_member, documents, libraries, member_directory, migrate, open_session, preview,
+                   probe, reset_member_token, resolve_session, set_admin_password, set_admin_state,
+                   set_availability, set_member_grants, set_member_state, set_owner, task_feed, upload,
+                   versions)
 from feishu_source import bind_feishu, fetch_feishu_section
 from docling_parser import FORMATS, MAX_FILE, ParseError
 from file_ingest import jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
@@ -38,11 +41,42 @@ Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, ma
 
 
 def admin_identity(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(auth)]):
+    """Accept a logged-in console session, or the deployment token.
+
+    The token stays valid because scripts/deploy-admin.sh and the cloud verification
+    use it headlessly; people are expected to log in with their own account so the
+    audit feed can tell them apart.
+    """
     secret = os.environ.get("KB_ADMIN_TOKEN", "")
-    if len(secret) < 32:
-        raise HTTPException(503, "管理后台尚未配置。")
-    if not credentials or not compare_digest(secret.encode(), credentials.credentials.encode()):
-        raise HTTPException(401, "请输入正确的管理令牌。")
+    if not credentials:
+        raise HTTPException(401, "请先登录。")
+    token = credentials.credentials
+    if len(secret) >= 32 and compare_digest(secret.encode(), token.encode()):
+        return {"id": "deploy", "username": "deploy", "name": "部署令牌"}
+    with connect() as db:
+        migrate(db)
+        row = resolve_session(db, token)
+    if not row:
+        raise HTTPException(401, "登录已过期，请重新登录。")
+    return {"id": row["id"], "username": row["username"], "name": row["display_name"] or row["username"]}
+
+
+# Login throttling stays in-process: there is one uvicorn worker, and a shared table
+# would mean a write on every failed attempt. nginx already caps the overall rate.
+_attempts: dict[str, list[float]] = {}
+ATTEMPT_WINDOW = 300
+ATTEMPT_LIMIT = 8
+
+
+def _throttled(key):
+    now = monotonic()
+    hits = [stamp for stamp in _attempts.get(key, []) if now - stamp < ATTEMPT_WINDOW]
+    _attempts[key] = hits
+    return len(hits) >= ATTEMPT_LIMIT
+
+
+def _record_failure(key):
+    _attempts.setdefault(key, []).append(monotonic())
 
 
 def reader_identity(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(auth)]):
@@ -53,6 +87,21 @@ def reader_identity(credentials: Annotated[HTTPAuthorizationCredentials | None, 
 
 class LibraryRequest(BaseModel):
     name: Title
+
+
+class LoginRequest(BaseModel):
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+    password: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+
+
+class AdminCreate(BaseModel):
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=32)]
+    password: Annotated[str, StringConstraints(min_length=10, max_length=200)]
+    name: Annotated[str, StringConstraints(strip_whitespace=True, max_length=60)] = ""
+
+
+class AdminPassword(BaseModel):
+    password: Annotated[str, StringConstraints(min_length=10, max_length=200)]
 
 
 class ChangeVersion(BaseModel):
@@ -129,6 +178,71 @@ def router(hybrid):
             if target.is_file() and target.is_relative_to(DIST.resolve()):
                 return FileResponse(target, headers=ASSET_HEADERS)
         return FileResponse(SHELL, media_type="text/html", headers=PAGE_HEADERS)
+
+    @routes.post("/v1/admin/login")
+    def login(payload: LoginRequest):
+        key = payload.username.lower()
+        if _throttled(key):
+            raise HTTPException(429, "尝试次数太多，请 5 分钟后再试。")
+        with connect() as db:
+            migrate(db)
+            try:
+                return open_session(db, payload.username, payload.password)
+            except ManagementError as error:
+                _record_failure(key)
+                raise HTTPException(401, str(error)) from None
+
+    @routes.post("/v1/admin/logout")
+    def logout(identity: Annotated[dict, Depends(admin_identity)],
+               credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(auth)]):
+        if credentials:
+            with connect() as db:
+                migrate(db)
+                close_session(db, credentials.credentials)
+        return {"ok": True}
+
+    @routes.get("/v1/admin/me")
+    def me(identity: Annotated[dict, Depends(admin_identity)]):
+        return identity
+
+    @control.get("/administrators")
+    def list_administrators():
+        with connect() as db:
+            migrate(db)
+            return admin_directory(db)
+
+    @control.post("/administrators", status_code=201)
+    def add_administrator(payload: AdminCreate):
+        with connect() as db:
+            migrate(db)
+            try:
+                return create_admin(db, payload.username, payload.password, payload.name)
+            except ManagementError as error:
+                raise HTTPException(422, str(error)) from None
+
+    @control.put("/administrators/{admin}/password")
+    def rotate_admin_password(admin: str, payload: AdminPassword):
+        with connect() as db:
+            migrate(db)
+            try:
+                set_admin_password(db, admin, payload.password)
+            except ManagementError as error:
+                raise HTTPException(404, str(error)) from None
+        return {"ok": True}
+
+    @control.put("/administrators/{admin}/state")
+    def switch_administrator(admin: str, payload: MemberState,
+                             identity: Annotated[dict, Depends(admin_identity)]):
+        # Locking yourself out of the only account is unrecoverable from the console.
+        if not payload.enabled and identity.get("id") == admin:
+            raise HTTPException(422, "不能停用当前登录的账号。")
+        with connect() as db:
+            migrate(db)
+            try:
+                set_admin_state(db, admin, payload.enabled)
+            except ManagementError as error:
+                raise HTTPException(404, str(error)) from None
+        return {"ok": True}
 
     @control.get("/libraries")
     def list_libraries():

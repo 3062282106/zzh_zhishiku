@@ -107,3 +107,27 @@ CREATE TABLE IF NOT EXISTS member_event (
 );
 CREATE INDEX IF NOT EXISTS member_event_recent ON member_event(created_at DESC);
 
+
+-- Console operators. Until now the console was unlocked by one shared token in
+-- api.env, so two people logging in were indistinguishable in the audit feed, and
+-- revoking one person meant rotating the token for everybody.
+CREATE TABLE IF NOT EXISTS admin_account (
+    id text PRIMARY KEY,
+    username text NOT NULL UNIQUE,
+    password_hash text NOT NULL,
+    display_name text,
+    enabled boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    last_login_at timestamptz
+);
+
+-- Session tokens are stored hashed for the same reason member tokens are: a database
+-- dump must not hand anyone a working credential. Expiry is checked on read, so a
+-- stale row is harmless even before the next cleanup pass.
+CREATE TABLE IF NOT EXISTS admin_session (
+    token_hash text PRIMARY KEY,
+    admin_id text NOT NULL REFERENCES admin_account(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_session_expiry ON admin_session(expires_at);

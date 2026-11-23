@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { auth, clearToken } from "./auth";
+import { auth, clearToken, setIdentity } from "./auth";
+import { api } from "./api";
 import { loadShell, resetStore } from "./store";
 import { fail } from "./toast";
 import { closeTopLayer } from "./layer";
@@ -14,11 +15,12 @@ const NAV = [
   { key: "sources", label: "同步来源", to: "/sources" },
   { key: "tasks", label: "处理任务", to: "/tasks" },
   { key: "members", label: "成员与权限", to: "/members" },
+  { key: "administrators", label: "管理员", to: "/administrators" },
   { key: "audit", label: "操作记录", to: "/audit" },
 ];
 const TITLES = {
   kb: "知识库", doc: "知识库", sources: "同步来源", tasks: "处理任务",
-  members: "成员与权限", audit: "操作记录", settings: "设置",
+  members: "成员与权限", administrators: "管理员", audit: "操作记录", settings: "设置",
 };
 
 const route = useRoute();
@@ -39,6 +41,9 @@ watch(
 
 async function connected() {
   try {
+    // Ask who we are first: the shell shows a name, and a stale session must bounce
+    // back to the login screen instead of loading four requests that all 401.
+    setIdentity(await api("/me"));
     const failed = await loadShell();
     if (failed) fail(failed.reason);
   } catch (error) {
@@ -52,7 +57,14 @@ onMounted(() => {
   if (auth.token) connected();
 });
 
-function logout() {
+async function logout() {
+  // Best effort: an expired session already fails server-side, and the local state
+  // must be cleared either way.
+  try {
+    await api("/logout", { method: "POST" });
+  } catch {
+    /* ignore */
+  }
   clearToken();
   resetStore();
   router.replace("/kb");
@@ -78,7 +90,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
       </nav>
       <div class="side-foot">
         <router-link class="btn link" to="/settings">设置</router-link>
-        <div class="who">管理员 · 内容负责人</div>
+        <div class="who">{{ auth.me ? auth.me.name : "管理员" }}</div>
         <button class="btn link" style="margin-top:8px" @click="logout">退出登录</button>
       </div>
     </aside>

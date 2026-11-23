@@ -1,10 +1,13 @@
 """Knowledge management operations and revision publication."""
+from base64 import b64decode, b64encode
 from contextlib import contextmanager
-from hashlib import sha256
+from hashlib import scrypt, sha256
+from hmac import compare_digest
 import json
+import os
 from pathlib import Path
 import re
-from secrets import token_urlsafe
+from secrets import token_bytes, token_urlsafe
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
@@ -50,7 +53,140 @@ def migrate(db):
         db.execute("SELECT pg_advisory_xact_lock(7319482165017)")
         db.execute((ROOT / "schema.sql").read_text(encoding="utf-8"))
         db.execute((ROOT / "admin_schema.sql").read_text(encoding="utf-8"))
+        bootstrap_admin(db)
     _migrated = True
+
+
+MIN_PASSWORD = 10
+ADMIN_ID = re.compile(r"a_[0-9a-f]{10}")
+ADMIN_USERNAME = re.compile(r"[A-Za-z0-9_.-]{3,32}")
+_SCRYPT = {"n": 16384, "r": 8, "p": 1}
+
+
+def hash_password(password):
+    """scrypt with a per-account salt, cost parameters encoded next to the digest.
+
+    Keeping the parameters in the string means they can be raised later without
+    invalidating passwords that were hashed with the old ones.
+    """
+    salt = token_bytes(16)
+    digest = scrypt(password.encode("utf-8"), salt=salt, dklen=32, **_SCRYPT)
+    return "scrypt${n}${r}${p}${salt}${digest}".format(
+        salt=b64encode(salt).decode(), digest=b64encode(digest).decode(), **_SCRYPT)
+
+
+def verify_password(password, stored):
+    try:
+        scheme, n, r, p, salt, digest = (stored or "").split("$")
+        if scheme != "scrypt":
+            return False
+        expected = b64decode(digest)
+        actual = scrypt(password.encode("utf-8"), salt=b64decode(salt), dklen=len(expected),
+                        n=int(n), r=int(r), p=int(p))
+    except (TypeError, ValueError):
+        return False
+    return compare_digest(actual, expected)
+
+
+def _check_password(password):
+    if len(password or "") < MIN_PASSWORD:
+        raise ManagementError(f"密码至少 {MIN_PASSWORD} 位。")
+
+
+def _check_username(username):
+    username = (username or "").strip()
+    if not ADMIN_USERNAME.fullmatch(username):
+        raise ManagementError("用户名只能用字母、数字、下划线、点和连字符，长度 3 到 32 位。")
+    return username
+
+
+def bootstrap_admin(db):
+    """Seed the first operator from api.env when no account exists yet.
+
+    Without it an upgrade leaves the console unusable: the shared token still works
+    for scripts, but a person has nothing to type into the login form.
+    """
+    if db.execute("SELECT 1 FROM admin_account LIMIT 1").fetchone():
+        return
+    password = (os.environ.get("KB_ADMIN_PASSWORD") or "").strip()
+    if len(password) < MIN_PASSWORD:
+        return
+    username = (os.environ.get("KB_ADMIN_USER") or "admin").strip() or "admin"
+    db.execute("INSERT INTO admin_account (id, username, password_hash, display_name) VALUES (%s,%s,%s,%s)",
+               ("a_" + uuid4().hex[:10], username, hash_password(password), "管理员"))
+
+
+def admin_directory(db):
+    with db.cursor(row_factory=dict_row) as cur:
+        return cur.execute("""
+            SELECT id, username, display_name, enabled, created_at, last_login_at
+            FROM admin_account ORDER BY created_at
+        """).fetchall()
+
+
+def create_admin(db, username, password, name=None):
+    username = _check_username(username)
+    _check_password(password)
+    display = (name or "").strip() or username
+    admin = "a_" + uuid4().hex[:10]
+    with db.transaction():
+        if db.execute("SELECT 1 FROM admin_account WHERE lower(username)=lower(%s)", (username,)).fetchone():
+            raise ManagementError("这个用户名已经有了。")
+        db.execute("INSERT INTO admin_account (id, username, password_hash, display_name) VALUES (%s,%s,%s,%s)",
+                   (admin, username, hash_password(password), display))
+    return {"id": admin, "username": username, "name": display}
+
+
+def set_admin_password(db, admin, password):
+    if not ADMIN_ID.fullmatch(admin or ""):
+        raise ManagementError("管理员不存在。")
+    _check_password(password)
+    with db.transaction():
+        changed = db.execute("UPDATE admin_account SET password_hash=%s WHERE id=%s",
+                             (hash_password(password), admin)).rowcount
+        # A password change must end existing sessions, otherwise a stolen session
+        # outlives the rotation that was supposed to fix it.
+        db.execute("DELETE FROM admin_session WHERE admin_id=%s", (admin,))
+    if not changed:
+        raise ManagementError("管理员不存在。")
+
+
+def set_admin_state(db, admin, enabled):
+    if not ADMIN_ID.fullmatch(admin or ""):
+        raise ManagementError("管理员不存在。")
+    with db.transaction():
+        changed = db.execute("UPDATE admin_account SET enabled=%s WHERE id=%s", (enabled, admin)).rowcount
+        if not enabled:
+            db.execute("DELETE FROM admin_session WHERE admin_id=%s", (admin,))
+    if not changed:
+        raise ManagementError("管理员不存在。")
+
+
+def open_session(db, username, password, hours=24):
+    with db.transaction():
+        row = db.execute("SELECT id, username, display_name, enabled, password_hash "
+                         "FROM admin_account WHERE lower(username)=lower(%s)",
+                         ((username or "").strip(),)).fetchone()
+        if not row or not row[3] or not verify_password(password, row[4]):
+            raise ManagementError("用户名或密码不对。")
+        token = token_urlsafe(32)
+        db.execute("INSERT INTO admin_session (token_hash, admin_id, expires_at) "
+                   "VALUES (%s,%s, now() + make_interval(hours => %s))", (token_hash(token), row[0], hours))
+        db.execute("UPDATE admin_account SET last_login_at=now() WHERE id=%s", (row[0],))
+    return {"token": token, "id": row[0], "username": row[1], "name": row[2] or row[1], "expires_in": hours * 3600}
+
+
+def resolve_session(db, token):
+    with db.cursor(row_factory=dict_row) as cur:
+        return cur.execute("""
+            SELECT a.id, a.username, a.display_name
+            FROM admin_session s JOIN admin_account a ON a.id = s.admin_id
+            WHERE s.token_hash=%s AND s.expires_at > now() AND a.enabled
+        """, (token_hash(token),)).fetchone()
+
+
+def close_session(db, token):
+    db.execute("DELETE FROM admin_session WHERE token_hash=%s", (token_hash(token),))
 
 
 def libraries(db):
