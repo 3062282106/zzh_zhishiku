@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The uploader extracts the release under umask 077; anything created here must still
+# be readable by the service account that runs the API.
+umask 022
 
 if [[ "$(id -u)" != 0 ]]; then
   echo 'Run this script as root on the existing knowledge-base ECS.'
@@ -86,8 +89,12 @@ for file in "${files[@]}"; do
   install -m 0644 -- "$release/$file" "$app/$file"
 done
 rm -rf -- "$app/web/dist"
-mkdir -p -- "$app/web/dist"
-cp -a -- "$web/." "$app/web/dist/"
+# The release tarball is extracted under umask 077 and carries the build machine's
+# numeric owners, so neither the modes nor the ownership may be preserved: the API
+# runs as kb-service and a console it cannot read surfaces as a 500 on /admin.
+install -d -m 0755 -- "$app/web" "$app/web/dist"
+cp -R -- "$web/." "$app/web/dist/"
+chown -R root:root -- "$app/web"
 if ! grep -q '^KB_ADMIN_TOKEN=' "$envfile"; then
   chmod 0600 "$envfile"
   printf '\nKB_ADMIN_TOKEN=%s\n' "$("$app/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(32))')" >> "$envfile"
@@ -110,7 +117,9 @@ page = urlopen("http://127.0.0.1:18081/admin/", timeout=5)
 body = page.read().decode("utf-8")
 assert page.status == 200 and '<div id="app">' in body, "console build is not being served"
 policy = page.headers["Content-Security-Policy"]
-assert "script-src 'self'" in policy and "'unsafe-inline'; style-src" in policy, policy
+assert "script-src 'self'" in policy, policy
+assert "style-src 'self' 'unsafe-inline'" in policy, policy
+assert "frame-ancestors 'none'" in policy, policy
 print("PASS: admin authentication, database schema and console build")
 PY
 systemctl is-active knowledge-kb-api.service knowledge-kb-mcp.service

@@ -79,14 +79,16 @@ def main():
     if any(flags) and not all(flags):
         parser.error("Provide all three Notion options together.")
     ssh = which("ssh")
-    scp = which("scp")
-    if ssh is None or scp is None:
+    if ssh is None:
         sys.exit("OpenSSH client is unavailable. Use Workbench to deploy instead.")
     command = deployment_command(args.bundle, *flags, tunnel=args.tunnel)
     options = ["-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "-o", "NumberOfPasswordPrompts=1"]
-    # The archive now carries the built console, so it is copied instead of being
-    # squeezed into a command-line argument.
-    uploaded = subprocess.call([scp, *options, str(args.bundle), f"root@{args.host}:{REMOTE}"])
+    # Upload over the ssh channel instead of scp: scp is deprecated upstream, and on
+    # Windows it cannot open local paths when the working directory is not ASCII.
+    with args.bundle.open("rb") as archive:
+        uploaded = subprocess.call(
+            [ssh, *options, f"root@{args.host}", f"cat > {REMOTE}"], stdin=archive,
+        )
     if uploaded:
         return uploaded
     forwarding = ["-L", "127.0.0.1:18085:127.0.0.1:18082", "-L", "127.0.0.1:18086:127.0.0.1:18081"] if args.tunnel else []

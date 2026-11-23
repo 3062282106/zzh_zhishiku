@@ -30,10 +30,25 @@ class ManagementError(ValueError):
     pass
 
 
+_migrated = False
+
+
 def migrate(db):
+    """Apply the schema once per process.
+
+    Every request used to run the whole schema inside its own transaction. The
+    console loads its shell with three requests in parallel, and concurrent DDL
+    deadlocks (observed in production as HTTP 500 on /v1/admin/audit). The
+    advisory lock serialises the first request; later ones skip it entirely.
+    """
+    global _migrated
+    if _migrated:
+        return
     with db.transaction():
+        db.execute("SELECT pg_advisory_xact_lock(7319482165017)")
         db.execute((ROOT / "schema.sql").read_text(encoding="utf-8"))
         db.execute((ROOT / "admin_schema.sql").read_text(encoding="utf-8"))
+    _migrated = True
 
 
 def libraries(db):
