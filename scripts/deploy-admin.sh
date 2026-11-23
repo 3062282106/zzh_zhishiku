@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" != 0 ]]; then
+  echo 'Run this script as root on the existing knowledge-base ECS.'
+  exit 1
+fi
+
+release="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+app=/opt/knowledge-kb
+envfile=/etc/knowledge-kb/api.env
+
+test -x "$app/.venv/bin/python"
+test -s "$envfile"
+systemctl is-active --quiet knowledge-kb-api.service
+systemctl is-active --quiet knowledge-kb-mcp.service
+
+files=(admin.py admin_api.py admin_schema.sql api.py docling_parser.py feishu_source.py file_ingest.py
+       notion_source.py search.py schema.sql)
+for file in "${files[@]}"; do
+  test -s "$release/$file"
+done
+"$app/.venv/bin/python" -m py_compile \
+  "$release"/{admin.py,admin_api.py,api.py,docling_parser.py,feishu_source.py,file_ingest.py,notion_source.py,search.py}
+
+# The console is a Vite build served from web/dist. Build it before packaging:
+#   npm --prefix web ci && npm --prefix web run build
+web="$release/web/dist"
+test -s "$web/index.html"
+if ! grep -q '<div id="app">' "$web/index.html"; then
+  echo 'web/dist/index.html is not the built console. Run npm --prefix web run build first.' >&2
+  exit 1
+fi
+# Asset names are hashed ASCII, so word splitting is safe here.
+for asset in $(grep -o 'assets/[A-Za-z0-9._-]*' "$web/index.html" | sort -u); do
+  test -s "$web/$asset"
+done
+
+backup="$(mktemp -d)"
+for file in "${files[@]}"; do
+  if [[ -f "$app/$file" ]]; then
+    cp -p -- "$app/$file" "$backup/$file"
+  fi
+done
+cp -p -- "$envfile" "$backup/api.env"
+if [[ -d "$app/web/dist" ]]; then
+  cp -a -- "$app/web/dist" "$backup/web-dist"
+fi
+
+deployed=false
+restore_on_failure() {
+  local status=$?
+  set +e
+  if [[ $deployed == false ]]; then
+    echo '部署未通过，正在恢复原服务文件。' >&2
+    for file in "${files[@]}"; do
+      if [[ -f "$backup/$file" ]]; then
+        cp -p -- "$backup/$file" "$app/$file"
+      else
+        rm -f -- "$app/$file"
+      fi
+    done
+    cp -p -- "$backup/api.env" "$envfile"
+    if [[ -d "$backup/web-dist" ]]; then
+      rm -rf -- "$app/web/dist"
+      cp -a -- "$backup/web-dist" "$app/web/dist"
+    fi
+    systemctl restart knowledge-kb-api.service knowledge-kb-mcp.service ||
+      echo '原文件已恢复，请检查 API 和 MCP 的服务日志。' >&2
+    for service in knowledge-kb-parser.service knowledge-kb-publisher.service; do
+      if systemctl cat "$service" >/dev/null 2>&1; then
+        systemctl restart "$service" || echo "请检查 $service 的日志。" >&2
+      fi
+    done
+  fi
+  for file in "${files[@]}" api.env; do
+    rm -f -- "$backup/$file"
+  done
+  rm -rf -- "$backup/web-dist"
+  rmdir -- "$backup"
+  return "$status"
+}
+trap restore_on_failure EXIT
+
+for file in "${files[@]}"; do
+  install -m 0644 -- "$release/$file" "$app/$file"
+done
+rm -rf -- "$app/web/dist"
+mkdir -p -- "$app/web/dist"
+cp -a -- "$web/." "$app/web/dist/"
+if ! grep -q '^KB_ADMIN_TOKEN=' "$envfile"; then
+  chmod 0600 "$envfile"
+  printf '\nKB_ADMIN_TOKEN=%s\n' "$("$app/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(32))')" >> "$envfile"
+fi
+systemctl restart knowledge-kb-api.service knowledge-kb-mcp.service
+curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18081/healthz
+printf '\n'
+"$app/.venv/bin/python" - <<'PY'
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+values = dict(line.split("=", 1) for line in Path("/etc/knowledge-kb/api.env").read_text().splitlines()
+              if line and not line.startswith("#") and "=" in line)
+req = Request("http://127.0.0.1:18081/v1/admin/libraries",
+              headers={"Authorization": "Bearer " + values["KB_ADMIN_TOKEN"]})
+with urlopen(req, timeout=5) as response:
+    assert response.status == 200
+
+page = urlopen("http://127.0.0.1:18081/admin/", timeout=5)
+body = page.read().decode("utf-8")
+assert page.status == 200 and '<div id="app">' in body, "console build is not being served"
+policy = page.headers["Content-Security-Policy"]
+assert "script-src 'self'" in policy and "'unsafe-inline'; style-src" in policy, policy
+print("PASS: admin authentication, database schema and console build")
+PY
+systemctl is-active knowledge-kb-api.service knowledge-kb-mcp.service
+for service in knowledge-kb-parser.service knowledge-kb-publisher.service; do
+  if systemctl is-active --quiet "$service"; then
+    systemctl restart "$service"
+  fi
+done
+deployed=true
