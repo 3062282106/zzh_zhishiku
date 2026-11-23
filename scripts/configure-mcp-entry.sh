@@ -18,12 +18,14 @@ usage() {
   cat >&2 <<'USAGE'
 用法：sudo bash scripts/configure-mcp-entry.sh <对外地址> <来源> [...]
 
-  对外地址   同事填进客户端的主机，例如 47.120.35.20
+  对外地址   同事填进客户端的主机。写 IP 走 http://IP:端口；写域名则视为已经由
+             Cloudflare 隧道或反向代理接管了 443，对外地址是 https://域名/mcp
   来源       any 表示不限制来源（只靠令牌），或者写 IP / CIDR，可以写多个
 
 例：
   sudo bash scripts/configure-mcp-entry.sh 47.120.35.20 any
   sudo bash scripts/configure-mcp-entry.sh 47.120.35.20 58.248.185.4 14.23.147.186
+  sudo bash scripts/configure-mcp-entry.sh kb.example.com any
 USAGE
   exit 1
 }
@@ -35,7 +37,13 @@ systemctl is-active --quiet knowledge-kb-mcp.service || { echo 'MCP 服务没有
 
 host="$1"
 shift
-public="http://$host:$port/mcp"
+# A domain means something already terminates TLS on 443 for us (Cloudflare tunnel,
+# or a reverse proxy on the box). An IP means colleagues dial the bare port.
+if [[ $host =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  public="http://$host:$port/mcp"
+else
+  public="https://$host/mcp"
+fi
 
 open=no
 access=
@@ -69,8 +77,10 @@ CONF
 
 cat > /etc/nginx/sites-available/kb-mcp <<CONF
 # 同事的 MCP 入口：只把 /mcp 转给回环上的 MCP 服务，其余路径一律 404。
+# default_server 是必须的：控制台入口也监听同一个端口，没有它，Host 不匹配的请求
+# 会落到先加载的那个 server 上，MCP 就会被 Basic Auth 拦掉。
 server {
-    listen $port;
+    listen $port default_server;
     server_name _;
     server_tokens off;
 
@@ -135,7 +145,13 @@ echo
 echo "入口已就绪：$public"
 echo "控制台的「复制接入说明」会自动带上这个地址。"
 echo
-if [[ $open == yes ]]; then
+if [[ $public == https://* ]]; then
+  cat <<DONE
+域名入口由隧道/反代接管 443，本机 nginx 仍然只监听 $port，不需要开任何入站端口，
+安全组里那条 $port/$port 的规则可以删掉。
+还差一步：把 $host 的 DNS/隧道指向这台机器的 http://127.0.0.1:$port。
+DONE
+elif [[ $open == yes ]]; then
   cat <<DONE
 来源不限制。还差一步，只能在阿里云控制台做：
   ECS → 安全组 → 入方向 → 把 $port/$port 那条规则的「授权对象」改成 0.0.0.0/0

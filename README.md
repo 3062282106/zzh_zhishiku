@@ -137,7 +137,9 @@ try {
 
 `KB_ADMIN_TOKEN` 仍然有效，部署脚本和云端验证用它；人走登录，这样审计里才分得清谁是谁。
 
-`GET /admin` 307 到 `/admin/`，由 FastAPI 直接提供 Vue 构建产物（`web/dist`），页面只调用 `/v1/admin` 下的接口，鉴权沿用 `KB_ADMIN_TOKEN`。页面结构按 Figma 定稿：左侧导航（知识库、同步来源、处理任务、成员与权限、操作记录、设置），右侧列表页，详情与操作放在右侧抽屉。
+同事要进来：在「管理员」页给他建一个账号，把 `https://admin.<域名>/admin/` 和用户名密码给他。账号可以随时停用，停用会立刻踢掉他所有在线会话。
+
+`GET /admin` 307 到 `/admin/`，由 FastAPI 直接提供 Vue 构建产物（`web/dist`），页面只调用 `/v1/admin` 下的接口，鉴权用登录换来的会话令牌。页面结构按 Figma 定稿：左侧导航（知识库、同步来源、处理任务、成员与权限、管理员、操作记录、设置），右侧列表页，详情与操作放在右侧抽屉。
 
 ### 前端工程
 
@@ -315,3 +317,19 @@ systemctl enable --now cloudflared
 **实测延迟**：免费版国内没有节点，隧道连到洛杉矶（日志里 `location=lax12`）。首次建连约 2.3 秒，其中 TLS 占 1.8 秒；同一连接上的后续请求约 0.5 秒。加上检索本身的一两秒，体感是「问一句等两秒」。要更快只有备案 + 国内直连。
 
 延迟不能接受的话，18443 那条直连可以留着当快通道，隧道留给在家或外出的场景——两条入口共用同一套鉴权和权限，不用改任何配置。
+
+**实测波动**：从国内家宽实测，同一域名有时 1.4 秒返回、有时 TLS 握手直接卡到超时（5 次里 3 次失败）。服务器自己访问是稳定的 1.4～1.9 秒，所以慢和断都发生在国内到 Cloudflare 边缘这一段。同事那边如果也这样，就让他改回 `http://<IP>:18443/mcp` 直连。
+
+### 把后台也挂到域名上
+
+后台和 MCP 共用 18443，靠 `Host` 区分：`kb.*` 走 MCP，`admin.*` 走控制台。
+
+```bash
+sudo bash scripts/configure-admin-entry.sh admin.example.com
+```
+
+脚本写 `/etc/nginx/sites-available/kb-admin`，然后在隧道 ingress 里加一条 `admin.example.com → http://127.0.0.1:18443` 并重启 `cloudflared`。
+
+**为什么后台只有一道密码。** 最早在 nginx 上加了 HTTP Basic Auth，想挡扫描器。实测行不通：浏览器把 Basic 凭据放在 `Authorization` 头里，而控制台把自己 24 小时的会话令牌也放在同一个头里——一个请求只能带一个 `Authorization`，于是每个接口调用到 nginx 都被判 401。要么把令牌挪到自定义头，要么去掉 Basic Auth；去掉更合适，因为「一个统一的管理员账号」本来就不该是两个密码。
+
+现在守着门口的是：scrypt 密码哈希、每个 IP 5 分钟内 8 次失败锁定、会话令牌只存 SHA-256 且 24 小时过期、nginx `120r/m` 限流。`scripts/configure-mcp-entry.sh` 里那条 `default_server` 不能删——`kb-admin` 按字母序先加载，没有它 `kb.*` 的请求会落到后台那个 server 块上。

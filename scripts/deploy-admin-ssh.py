@@ -14,7 +14,7 @@ REQUIRED = {
     "admin.py", "admin_api.py", "admin_schema.sql", "api.py", "docling_parser.py", "feishu_source.py",
     "file_ingest.py", "notion_source.py", "search.py", "schema.sql",
     "scripts/deploy-admin.sh", "scripts/verify-admin-cloud.py", "scripts/configure-notion.sh",
-    "scripts/configure-mcp-entry.sh",
+    "scripts/configure-mcp-entry.sh", "scripts/configure-admin-entry.sh",
 }
 # The console is a Vite build; its hashed asset names change on every build, so the
 # archive is validated by prefix instead of by an exact file list.
