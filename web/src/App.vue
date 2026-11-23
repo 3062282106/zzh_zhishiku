@@ -14,26 +14,19 @@ const NAV = [
   { title: "知识管理", items: [
     { key: "kb", label: "知识库", to: "/kb" },
     { key: "sources", label: "同步来源", to: "/sources" },
-    { key: "tasks", label: "处理任务", to: "/tasks" },
   ] },
   { title: "访问管理", items: [
     { key: "members", label: "成员与权限", to: "/members" },
-    { key: "administrators", label: "管理员", to: "/administrators" },
-  ] },
-  { title: "运行记录", items: [
-    { key: "retrieval", label: "检索记录", to: "/retrieval" },
-    { key: "audit", label: "操作记录", to: "/audit" },
   ] },
 ];
 const TITLES = {
-  kb: "知识库", doc: "知识库", sources: "同步来源", tasks: "处理任务",
-  members: "成员与权限", administrators: "管理员", retrieval: "检索记录", audit: "操作记录", settings: "设置",
+  kb: "知识库", doc: "知识库", sources: "同步来源", members: "成员与权限",
 };
 
 const route = useRoute();
 const router = useRouter();
 const activeKey = computed(() => (route.name === "doc" ? "kb" : route.name));
-const title = computed(() => TITLES[route.name] || "知识库");
+const title = computed(() => route.meta.operations ? "运维管理" : TITLES[route.name] || "知识库");
 const view = ref(null);
 const checking = ref(false);
 const sessionError = ref("");
@@ -127,8 +120,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
         </div>
       </nav>
       <div class="side-foot">
-        <router-link class="btn link" to="/settings">设置</router-link>
-        <div class="who">{{ auth.me.name }}</div>
+        <router-link class="btn link" to="/operations" :class="{ 'operations-active': route.meta.operations }">运维管理</router-link>
         <button class="btn link" style="margin-top:8px" @click="logout">退出登录</button>
       </div>
     </aside>

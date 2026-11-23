@@ -4,6 +4,7 @@ import PageHead from "../components/PageHead.vue";
 import EmptyState from "../components/EmptyState.vue";
 import Drawer from "../components/Drawer.vue";
 import { api, enc } from "../api";
+import { auth, clearToken } from "../auth";
 import { store, loadMembers, loadSettings } from "../store";
 import { activeGrants, toLocalInput, iso } from "../format";
 import { toast, toastError, fail } from "../toast";
@@ -17,7 +18,17 @@ const chosen = ref([]);
 const expires = ref("");
 const webEmail = ref("");
 
-const form = ref({ name: "", email: "", libraries: [], expires: "" });
+const emptyForm = () => ({ name: "", email: "", libraries: [], expires: "", admin: false, username: "", password: "" });
+const form = ref(emptyForm());
+const administrators = ref([]);
+const managedAdmin = ref(null);
+const adminPassword = ref("");
+const accounts = computed(() => [...store.members, ...administrators.value]);
+
+async function loadAdministrators() {
+  const list = await api("/administrators");
+  administrators.value = list.map((item) => ({ ...item, name: item.display_name || item.username, kind: "admin" }));
+}
 // The plaintext token exists only in this object: the server stores a hash and
 // cannot return it again, so closing this drawer means it is gone for good.
 const issued = ref(null);
@@ -25,10 +36,11 @@ const WEB_STATUS = { not_enabled: "未开通", active: "已设置密码", pendin
 
 const rows = computed(() => {
   const needle = q.value.trim().toLowerCase();
-  if (!needle) return store.members;
-  return store.members.filter((item) =>
+  if (!needle) return accounts.value;
+  return accounts.value.filter((item) =>
     item.name.toLowerCase().includes(needle) ||
     String(item.email || "").toLowerCase().includes(needle) ||
+    String(item.username || "").toLowerCase().includes(needle) ||
     item.id.toLowerCase().includes(needle));
 });
 const granted = computed(() => rows.value.filter((item) => activeGrants(item).length).length);
@@ -36,10 +48,16 @@ const active = computed(() => rows.value.filter((item) => item.enabled).length);
 
 onMounted(() => {
   loadMembers().catch(fail);
+  loadAdministrators().catch(fail);
   loadSettings().catch(() => {});
 });
 
 function openMember(item) {
+  if (item.kind === "admin") {
+    adminPassword.value = "";
+    managedAdmin.value = item;
+    return;
+  }
   member.value = item;
   webEmail.value = item.email || "";
   chosen.value = activeGrants(item).map((grant) => grant.library);
@@ -76,7 +94,7 @@ async function save() {
 }
 
 function openCreate() {
-  form.value = { name: "", email: "", libraries: [], expires: "" };
+  form.value = emptyForm();
   createOpen.value = true;
 }
 
@@ -86,6 +104,14 @@ async function create() {
   if (!name) return toastError("请填写成员姓名。");
   busy.value = true;
   try {
+    if (form.value.admin) {
+      await api("/administrators", { method: "POST", body: { name, username: form.value.username.trim(), password: form.value.password } });
+      form.value = emptyForm();
+      createOpen.value = false;
+      await loadAdministrators();
+      toast("管理员已创建。");
+      return;
+    }
     const created = await api("/members", {
       method: "POST",
       body: {
@@ -98,6 +124,29 @@ async function create() {
     createOpen.value = false;
     issued.value = created;
     await loadMembers();
+  } catch (error) {
+    fail(error);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function updateAdministrator(action) {
+  const target = managedAdmin.value;
+  if (!target || busy.value || (action === "state" && target.id === auth.me?.id)) return;
+  busy.value = true;
+  try {
+    const body = action === "password" ? { password: adminPassword.value } : { enabled: !target.enabled };
+    await api("/administrators/" + enc(target.id) + "/" + action, { method: "PUT", body });
+    managedAdmin.value = null;
+    adminPassword.value = "";
+    if (action === "password" && target.id === auth.me?.id) {
+      clearToken();
+      toast("密码已更新，请重新登录。");
+    } else {
+      await loadAdministrators();
+      toast(action === "password" ? "密码已更新。" : target.enabled ? "管理员已停用。" : "管理员已启用。");
+    }
   } catch (error) {
     fail(error);
   } finally {
@@ -245,7 +294,7 @@ async function copy(text, label) {
         <input v-model="q" class="search" type="text" placeholder="搜索姓名、邮箱或账号">
       </div>
 
-      <EmptyState v-if="!store.members.length" title="还没有成员"
+      <EmptyState v-if="!accounts.length" title="还没有成员"
                   note="点右上角「新建成员」，填名字、勾上能看的库，把令牌发给他就能用。" />
       <EmptyState v-else-if="!rows.length" title="没有匹配的成员" note="换个姓名或邮箱再试。" />
 
@@ -262,14 +311,15 @@ async function copy(text, label) {
             <tr v-for="item in rows" :key="item.id" @click="openMember(item)">
               <td>
                 <div class="t-main">{{ item.name }}</div>
-                <div class="t-sub">{{ item.email || item.id }}</div>
+                <div class="t-sub">{{ item.email || item.username || item.id }}</div>
               </td>
-              <td class="muted">{{ item.kind === "guest" ? "受邀个人" : "企业员工" }}</td>
+              <td><span v-if="item.kind === 'admin'" class="pill live">管理员</span><span v-else class="muted">{{ item.kind === "guest" ? "受邀个人" : "企业员工" }}</span></td>
               <td class="muted">
-                {{ activeGrants(item).length ? activeGrants(item).map((g) => g.name).join("、") : "—" }}
+                {{ item.kind === 'admin' ? '管理全部知识库' : activeGrants(item).map((g) => g.name).join("、") || "—" }}
               </td>
               <td>
                 <span v-if="!item.enabled" class="pill expired">已停用</span>
+                <span v-else-if="item.kind === 'admin'" class="pill live">已启用</span>
                 <span v-else-if="activeGrants(item).length" class="pill live">已授权</span>
                 <span v-else class="pill draft">未授权</span>
               </td>
@@ -347,8 +397,14 @@ async function copy(text, label) {
   <Drawer v-if="createOpen" title="新建成员" @close="createOpen = false">
     <div class="field">
       <label>姓名</label>
-      <input v-model="form.name" type="text" placeholder="例如：张三" maxlength="120">
+      <input v-model="form.name" type="text" placeholder="例如：张三" :maxlength="form.admin ? 60 : 120">
     </div>
+    <div class="field"><div class="checks"><label><input v-model="form.admin" type="checkbox">设为管理员</label></div></div>
+    <template v-if="form.admin">
+      <div class="field"><label for="admin-username">管理员用户名</label><input id="admin-username" v-model="form.username" maxlength="32" autocomplete="off"></div>
+      <div class="field"><label for="admin-password">初始密码（至少 10 位）</label><input id="admin-password" v-model="form.password" type="password" maxlength="200" autocomplete="new-password"></div>
+    </template>
+    <template v-else>
     <div class="field">
       <label>成员邮箱（用于网页登录）</label>
       <input v-model="form.email" type="email" placeholder="name@company.com" maxlength="200">
@@ -367,9 +423,18 @@ async function copy(text, label) {
       <label>访问到期时间（留空表示长期）</label>
       <input v-model="form.expires" type="datetime-local">
     </div>
+    </template>
     <template #footer>
       <button class="btn" @click="createOpen = false">取消</button>
       <button class="btn primary" :disabled="busy" @click="create">创建成员</button>
+    </template>
+  </Drawer>
+
+  <Drawer v-if="managedAdmin" title="管理管理员" :subtitle="managedAdmin.name" @close="managedAdmin = null">
+    <div class="field"><label for="reset-admin-password">新密码（至少 10 位）</label><input id="reset-admin-password" v-model="adminPassword" type="password" maxlength="200" autocomplete="new-password"></div>
+    <template #footer>
+      <button class="btn" :disabled="busy || managedAdmin.id === auth.me?.id" @click="updateAdministrator('state')">{{ managedAdmin.enabled ? '停用' : '启用' }}</button>
+      <button class="btn primary" :disabled="busy || adminPassword.length < 10" @click="updateAdministrator('password')">重置密码</button>
     </template>
   </Drawer>
 
