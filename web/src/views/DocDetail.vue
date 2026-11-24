@@ -248,7 +248,8 @@ async function onPublished(info) {
         </div>
         <div class="page-actions">
           <button class="btn" @click="historyOpen = true">版本历史</button>
-          <DocMenu :doc="menuDoc" size="" @changed="reload" />
+          <DocMenu :doc="menuDoc" size="" @changed="reload"
+                   @deleted="router.replace({ name: 'kb', params: { libraryId } })" />
           <button class="btn primary" :disabled="isCurrent" @click="publish(row)">
             {{ isCurrent ? "已生效" : "发布" }}
           </button>

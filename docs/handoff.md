@@ -138,6 +138,11 @@ cat scripts/configure-admin-entry.sh | ssh root@47.120.35.20 \
 
 ---
 
+### 文件上传和文档删除
+
+- 个人库页面可上传本地文件，复用解析和发布 worker，自动发布。MCP 的 `upload_knowledge_file` 接受客户端读取的附件字节，`get_knowledge_file_status` 查询结果。网页限 20 MiB，MCP 附件限 5 MiB。
+- 企业及个人库的「删除」移除知识库内的原件、版本、分块和来源绑定。发布 worker 会清理已登记的 OpenSearch 索引。「下架」可恢复。
+
 ### MCP 飞书链接导入
 
 - 在飞书开放平台为现有企业自建应用开通用户身份权限 `docx:document:readonly`、`wiki:wiki:readonly`、`contact:user.email:readonly`、`contact:user.employee:readonly`，并发布应用版本。

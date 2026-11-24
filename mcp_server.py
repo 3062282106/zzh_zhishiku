@@ -23,6 +23,7 @@ from pydantic import Field, StringConstraints
 
 BASE_URL = "http://127.0.0.1:18081"
 TOKEN_FILE = ROOT / ".local" / "test-accounts.json"
+MAX_ATTACHMENT_BASE64 = 4 * ((5 * 1024 * 1024 + 2) // 3)
 
 
 class RejectRedirects(HTTPRedirectHandler):
@@ -42,7 +43,7 @@ def request(path, token, body=None):
         with OPENER.open(Request(BASE_URL + path, data=data, headers=headers), timeout=50) as response:
             return json.load(response)
     except HTTPError as error:
-        if path.startswith("/v1/knowledge/imports/feishu"):
+        if path.startswith("/v1/knowledge/imports/"):
             try:
                 detail = json.load(error).get("detail")
             except (OSError, ValueError):
@@ -109,6 +110,29 @@ def create_server(get_token):
     ) -> CallToolResult:
         """查询自己提交的飞书导入任务。processing 表示后台正在处理。发布完成后可检索个人内容。"""
         return tool_result(request(f"/v1/knowledge/imports/feishu/{job_id}", get_token()))
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                             idempotent_hint=False, open_world_hint=True))
+    def upload_knowledge_file(
+        filename: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)],
+        content_base64: Annotated[str, StringConstraints(min_length=1, max_length=MAX_ATTACHMENT_BASE64)],
+        library: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
+        title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
+    ) -> CallToolResult:
+        """根据用户明确请求上传实际附件。支持 PDF、DOCX、XLSX、CSV、PPTX、图片、Markdown 和 TXT，最大 5 MiB。
+        content_base64 必须由客户端读取附件原始字节并编码。个人库默认，企业库须指定已获授权的名称或 ID。
+        返回任务字段 id，用 get_knowledge_file_status 查询。个人库解析后自动发布，企业库生成草稿。"""
+        return tool_result(request("/v1/knowledge/imports/files", get_token(), {
+            "filename": filename, "content_base64": content_base64, "library": library, "title": title,
+        }))
+
+    @server.tool(annotations=read_only)
+    def get_knowledge_file_status(
+        job_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9-]{36}$")],
+    ) -> CallToolResult:
+        """检查本次附件上传的解析与发布状态。个人库 publication_status 为 published 后可以检索。
+        企业库 status 为 ready 时草稿已生成。"""
+        return tool_result(request(f"/v1/knowledge/imports/files/{job_id}", get_token()))
 
     return server
 

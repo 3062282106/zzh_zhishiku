@@ -10,7 +10,7 @@ const props = defineProps({
   doc: { type: Object, required: true },
   size: { type: String, default: "sm" },
 });
-const emit = defineEmits(["changed", "open-doc", "history"]);
+const emit = defineEmits(["changed", "deleted", "open-doc", "history"]);
 
 const ownerOpen = ref(false);
 
@@ -49,6 +49,19 @@ function unpublish() {
   });
 }
 
+function remove() {
+  confirmBox({
+    title: "删除这份文档？", keys: props.doc.title,
+    note: "文档、版本和上传原件将从知识库中删除。",
+    label: "确认删除", danger: true,
+    action: async () => {
+      await api("/documents/" + enc(props.doc.id), { method: "DELETE" });
+      toast("已删除文档。");
+      emit("deleted");
+    },
+  });
+}
+
 async function restore() {
   try {
     await setPublished(true);
@@ -69,6 +82,7 @@ async function restore() {
       <button v-if="doc.visibility_status === 'live' || doc.visibility_status === 'pending'"
               class="danger" @click="close(); unpublish()">立即下架</button>
       <button v-else-if="doc.current_version" @click="close(); restore()">恢复上线</button>
+      <button class="danger" @click="close(); remove()">删除文档</button>
     </template>
   </MenuButton>
 

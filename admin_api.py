@@ -16,7 +16,7 @@ from pydantic import BaseModel, StringConstraints
 from access import (connect, is_member_web_token, member_web_identity, reader_digest, reader_id,
                     reader_visibility, token_hash)
 from admin import (ManagementError, WebLoginError, access_contact_url, activate, admin_directory, audit_feed,
-                   close_session, create_admin, create_member, documents, issue_member_web_setup, libraries,
+                   close_session, create_admin, create_member, delete_document, documents, issue_member_web_setup, libraries,
                    member_directory, migrate, open_member_web_session, open_session, preview,
                    probe, reset_member_token, resolve_session, retrieval_feed, set_admin_password, set_admin_state,
                    set_access_contact_url, set_availability, set_member_grants, set_member_state, set_owner, task_feed, upload,
@@ -594,6 +594,16 @@ def router(hybrid):
         if not row:
             raise HTTPException(404, "找不到原文件。")
         return file_response(row)
+
+    @control.delete("/documents/{document}")
+    def remove_document(document: UUID):
+        try:
+            with connect() as db:
+                if not delete_document(db, str(document)):
+                    raise HTTPException(404, "找不到此文档。")
+        except ManagementError as error:
+            raise HTTPException(409, str(error)) from None
+        return {"deleted": True}
 
     @control.get("/documents/{document}/versions")
     def list_versions(document: UUID):

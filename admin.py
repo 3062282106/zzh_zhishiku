@@ -344,11 +344,8 @@ def set_availability(db, document, expected, expected_published, expected_valid_
     return {"published": published, "valid_until": valid_until, "valid_from": valid_from}
 
 
-def upload(db, library, document, title, filename, original, metadata=None, *,
-           source_url=None, provider="upload", line_blocks=None):
-    document = document or str(uuid4())
-    version = uuid4()
-    source = source_url or f"/v1/knowledge/originals/{document}/{version}"
+def markdown_chunks(document, version, title, original, source, metadata=None, *,
+                    provider="upload", line_blocks=None):
     metadata = normalize(metadata)
     chunks = []
     limit = 2_000 if provider == "feishu" else 200
@@ -370,22 +367,84 @@ def upload(db, library, document, title, filename, original, metadata=None, *,
             })
     if not chunks:
         raise ManagementError("文档没有可以检索的正文。")
+    return chunks
+
+
+def upload(db, library, document, title, filename, original, metadata=None, *,
+           source_url=None, provider="upload", line_blocks=None):
+    create = document is None
+    document = document or str(uuid4())
+    version = uuid4()
+    source = source_url or f"/v1/knowledge/originals/{document}/{version}"
+    chunks = markdown_chunks(document, version, title, original, source, metadata,
+                             provider=provider, line_blocks=line_blocks)
     return save_version(db, library, document, version, title, filename, original, chunks,
-                        online=source_url is not None)
+                        online=source_url is not None, create=create)
 
 
-def save_version(db, library, document, version, title, filename, original, chunks, *, online=False):
+def delete_document(db, document):
+    with db.transaction():
+        db.execute("SELECT id FROM managed_source WHERE document_platform='upload' AND document_id=%s FOR UPDATE",
+                   (document,)).fetchall()
+        row = db.execute("""
+            SELECT kb_id FROM source_document WHERE platform='upload' AND document_id=%s FOR UPDATE
+        """, (document,)).fetchone()
+        if row is None:
+            return False
+        jobs = db.execute("""
+            SELECT publication_status FROM managed_file WHERE document_id=%s FOR UPDATE
+        """, (document,)).fetchall()
+        if any(state == "indexing" for state, in jobs):
+            raise ManagementError("文档正在构建索引，完成后可以删除。")
+        db.execute("""
+            INSERT INTO managed_delete_event (document_id, library, title)
+            SELECT %s, %s, COALESCE(
+                (SELECT title FROM managed_version WHERE platform='upload' AND document_id=%s
+                 ORDER BY created_at DESC LIMIT 1),
+                (SELECT title FROM managed_file WHERE document_id=%s ORDER BY created_at DESC LIMIT 1),
+                (SELECT title FROM managed_source WHERE document_platform='upload' AND document_id=%s),
+                '文档')
+            WHERE EXISTS (SELECT 1 FROM knowledge_base WHERE id=%s AND owner_member_id IS NULL)
+        """, (document, row[0], document, document, document, row[0]))
+        db.execute("""
+            INSERT INTO managed_index_cleanup (index_name)
+            SELECT DISTINCT i.name FROM managed_version v
+            CROSS JOIN LATERAL unnest(ARRAY[v.keyword_index, v.vector_index]) AS i(name)
+            WHERE v.platform='upload' AND v.document_id=%s
+              AND i.name ~ '^kb-local-(chunks|hybrid)-managed-[a-f0-9]{16}$'
+            ON CONFLICT DO NOTHING
+        """, (document,))
+        db.execute("DELETE FROM managed_file WHERE document_id=%s", (document,))
+        db.execute("DELETE FROM managed_source WHERE document_platform='upload' AND document_id=%s", (document,))
+        db.execute("""
+            DELETE FROM managed_availability_event WHERE version_id IN (
+                SELECT id FROM managed_version WHERE platform='upload' AND document_id=%s
+            )
+        """, (document,))
+        db.execute("""
+            DELETE FROM managed_publish_event WHERE version_id IN (
+                SELECT id FROM managed_version WHERE platform='upload' AND document_id=%s
+            )
+        """, (document,))
+        db.execute("DELETE FROM source_chunk WHERE platform='upload' AND document_id=%s", (document,))
+        db.execute("DELETE FROM managed_version WHERE platform='upload' AND document_id=%s", (document,))
+        db.execute("DELETE FROM source_document WHERE platform='upload' AND document_id=%s", (document,))
+        return True
+
+
+def save_version(db, library, document, version, title, filename, original, chunks, *, online=False, create=False):
     with db.transaction():
         if not db.execute("SELECT 1 FROM knowledge_base WHERE id = %s", (library,)).fetchone():
             raise ManagementError("找不到此知识库。")
-        db.execute("""
-            INSERT INTO source_document (platform, document_id, kb_id, current_version, published)
-            VALUES ('upload', %s, %s, '', false) ON CONFLICT DO NOTHING
-        """, (document, library))
-        actual_library, = db.execute("""
+        if create:
+            db.execute("""
+                INSERT INTO source_document (platform, document_id, kb_id, current_version, published)
+                VALUES ('upload', %s, %s, '', false) ON CONFLICT DO NOTHING
+            """, (document, library))
+        row = db.execute("""
             SELECT kb_id FROM source_document WHERE platform='upload' AND document_id=%s FOR UPDATE
         """, (document,)).fetchone()
-        if actual_library != library:
+        if not row or row[0] != library:
             raise ManagementError("文档不属于当前知识库。")
         if not online and db.execute("SELECT 1 FROM managed_source WHERE document_id=%s", (document,)).fetchone():
             raise ManagementError("此文档已绑定在线来源，请从来源同步新版。")
@@ -716,7 +775,7 @@ def task_feed(db, library=None, days=30):
 
 
 AUDIT_KINDS = {"publish": "发布", "rollback": "回滚", "unpublish": "下架", "restore": "恢复上线",
-               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问", **MEMBER_EVENTS}
+               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问", "delete": "删除文档", **MEMBER_EVENTS}
 
 
 def retrieval_feed(db, *, days, member, library, status, before, limit):
@@ -769,6 +828,10 @@ def audit_feed(db, library=None, kind=None, limit=200):
                 JOIN managed_version mv ON mv.id = a.version_id
                 JOIN source_document d ON d.platform='upload' AND d.document_id = a.document_id
                 JOIN knowledge_base kb ON kb.id = d.kb_id AND kb.owner_member_id IS NULL
+                UNION ALL
+                SELECT 'deletion', e.created_at, 'delete', e.library, kb.name, e.title, NULL, e.document_id, NULL
+                FROM managed_delete_event e
+                JOIN knowledge_base kb ON kb.id=e.library AND kb.owner_member_id IS NULL
                 UNION ALL
                 SELECT 'grant', g.updated_at, CASE WHEN g.revoked_at IS NULL THEN 'grant' ELSE 'revoke' END,
                        g.kb_id, kb.name, COALESCE(m.display_name, m.id), NULL, NULL, m.id

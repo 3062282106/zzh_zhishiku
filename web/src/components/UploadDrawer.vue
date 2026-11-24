@@ -1,13 +1,14 @@
 <script setup>
 import { ref } from "vue";
 import Drawer from "./Drawer.vue";
-import { api, enc } from "../api";
+import { api, enc, knowledgeApi } from "../api";
 import { toast, fail } from "../toast";
 import { libraryById } from "../store";
 
 const props = defineProps({
   libraryId: { type: String, default: "" },
   documentId: { type: String, default: "" },
+  personal: { type: Boolean, default: false },
 });
 const emit = defineEmits(["close", "uploaded"]);
 
@@ -38,7 +39,7 @@ function dropped(event) {
 
 async function upload() {
   if (busy.value) return;
-  if (!props.libraryId) return toast("请先选择知识库。");
+  if (!props.personal && !props.libraryId) return toast("请先选择知识库。");
   if (!file.value) return toast("请选择要上传的文件。");
   if (!title.value.trim()) return toast("请填写文档标题。");
   busy.value = true;
@@ -47,7 +48,9 @@ async function upload() {
   form.set("file", file.value);
   if (props.documentId) form.set("document_id", props.documentId);
   try {
-    const result = await api("/libraries/" + enc(props.libraryId) + "/documents", { method: "POST", body: form });
+    const result = props.personal
+      ? await knowledgeApi("/personal/files", { method: "POST", body: form })
+      : await api("/libraries/" + enc(props.libraryId) + "/documents", { method: "POST", body: form });
     emit("uploaded", result);
   } catch (error) {
     fail(error);
@@ -61,7 +64,7 @@ async function upload() {
   <Drawer :title="documentId ? '上传新版' : '上传文档'" :subtitle="library() ? library().name : ''" @close="$emit('close')">
     <div class="block">
       <div class="k">目标知识库</div>
-      <div class="v">{{ library() ? library().name : "未选择" }}</div>
+      <div class="v">{{ personal ? "个人知识库" : library()?.name || "未选择" }}</div>
     </div>
     <div class="field">
       <label>文档标题</label>
@@ -78,7 +81,7 @@ async function upload() {
       <input ref="picker" type="file" hidden :accept="ACCEPT" @change="choose">
     </div>
     <div class="note">
-      {{ documentId ? "上传后会生成新草稿，核对分块后再发布。" : "上传后自动解析；解析完成会出现在处理任务里，可直接打开草稿。" }}
+      {{ personal ? "处理完成后自动发布。" : documentId ? "上传后会生成新草稿，核对分块后再发布。" : "上传后自动解析；解析完成会出现在处理任务里，可直接打开草稿。" }}
     </div>
     <template #footer>
       <button class="btn" @click="$emit('close')">取消</button>

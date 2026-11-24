@@ -1,8 +1,11 @@
 """MCP import and owner-only draft management endpoints."""
 
+from base64 import b64decode
+from binascii import Error as Base64Error
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 from secrets import compare_digest, token_urlsafe
 from threading import Lock
 from time import monotonic
@@ -10,18 +13,20 @@ from typing import Annotated
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, StringConstraints
 
 from access import connect, token_hash
-from admin import ManagementError, activate, documents, preview, versions
+from admin import ManagementError, activate, delete_document, documents, preview, set_availability, versions
 from admin_api import Title, admin_identity, reader_identity
 from agent_import import (CALLBACK, OAuthFailure, admin_import_access, begin_oauth, complete_oauth,
                           console_path, import_identity, issue_admin_import_token, oauth_requests,
                           personal_library, set_admin_import_access, stage_feishu_import, target_library,
                           upload_enabled, user_token, web_importer)
+from docling_parser import MAX_FILE, ParseError
 from feishu_source import parse_link
+from file_ingest import SUPPORTED_SUFFIXES, file_status, jobs as file_jobs, queue as queue_file
 from notion_source import SourceError
 
 
@@ -82,6 +87,22 @@ def import_outcome(job_id, job):
         return {"status": "processing", "job_id": str(job_id), "message": "正在后台导入，可查询任务进度。"}
 
 
+MAX_MCP_FILE = 5 * 1024 * 1024
+MAX_BASE64 = 4 * ((MAX_MCP_FILE + 2) // 3)
+
+
+class FileImport(BaseModel):
+    filename: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    content_base64: Annotated[str, StringConstraints(min_length=1, max_length=MAX_BASE64)]
+    title: Title | None = None
+    library: Title | None = None
+
+
+class PersonalVisibility(BaseModel):
+    expected_version: UUID
+    published: bool
+
+
 class AdminImportAccess(BaseModel):
     email: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
     libraries: list[Title]
@@ -105,6 +126,26 @@ def member_actor(db, token):
     if actor.role != "member":
         raise SourceError("请使用成员账号。", 403)
     return actor
+
+
+def personal_writer(db, token):
+    actor = member_actor(db, token)
+    permitted = db.execute("""
+        SELECT 1 FROM member_account WHERE id=%s AND enabled AND personal_upload FOR UPDATE
+    """, (actor.id,)).fetchone()
+    if not permitted or member_actor(db, token) != actor:
+        raise SourceError("你的账号尚未开通上传权限。", 403)
+    return actor
+
+
+def queue_new_file(db, library, filename, content, title=None):
+    filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    if len(filename) > 200 or Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
+        raise SourceError("请选择 PDF、DOCX、XLSX、CSV、PPTX、扫描图片、Markdown 或 TXT。", 422)
+    try:
+        return queue_file(db, library, None, title or Path(filename).stem[:160], filename, content)
+    except ParseError as error:
+        raise SourceError(str(error), 422) from None
 
 
 def owned_document(db, actor, document):
@@ -143,6 +184,46 @@ def router(hybrid):
             with connect() as db:
                 target_library(db, import_identity(db, token), job.key[2])
             return import_outcome(job_id, job)
+        except SourceError as error:
+            raise translate(error) from None
+
+    @routes.post("/v1/knowledge/imports/files", status_code=202)
+    def import_mcp_file(payload: FileImport, token: Session, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            with connect() as db, db.transaction():
+                actor = import_identity(db, token, lock=True)
+                library, _ = target_library(db, actor, payload.library)
+                try:
+                    data = b64decode(payload.content_base64, validate=True)
+                except (Base64Error, ValueError):
+                    raise SourceError("附件内容不是有效的 Base64。", 422) from None
+                if len(data) > MAX_MCP_FILE:
+                    raise SourceError("MCP 支持 5 MiB 以内的附件。更大的文件请在知识库网页上传。", 413)
+                if actor.role == "member":
+                    library = personal_library(db, actor.id, create=True)
+                return queue_new_file(db, library, payload.filename, data, payload.title)
+        except ManagementError as error:
+            raise translate(error) from None
+
+    @routes.get("/v1/knowledge/imports/files/{job_id}")
+    def mcp_file_status(job_id: UUID, token: Session, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            with connect() as db:
+                actor = import_identity(db, token)
+                if actor.role == "member":
+                    library = personal_library(db, actor.id)
+                else:
+                    allowed = db.execute("""
+                        SELECT f.library FROM managed_file f JOIN admin_upload_grant g ON g.library=f.library
+                        JOIN knowledge_base k ON k.id=f.library AND k.owner_member_id IS NULL
+                        WHERE f.id=%s AND g.admin_id=%s
+                    """, (job_id, actor.id)).fetchone()
+                    library = allowed[0] if allowed else None
+                if not library or (job := file_status(db, job_id, library)) is None:
+                    raise SourceError("找不到可访问的附件任务。", 404)
+                return job
         except SourceError as error:
             raise translate(error) from None
 
@@ -208,9 +289,55 @@ def router(hybrid):
                 actor = member_actor(db, token)
                 library = personal_library(db, actor.id)
                 return {"upload_enabled": upload_enabled(db, actor),
-                        "documents": documents(db, library) if library else []}
+                        "documents": documents(db, library) if library else [],
+                        "jobs": file_jobs(db, library) if library else []}
         except SourceError as error:
             raise translate(error) from None
+
+    @routes.post("/v1/knowledge/personal/files", status_code=202)
+    def upload_personal(token: Session, response: Response, file: Annotated[UploadFile, File()],
+                        title: Annotated[Title, Form()]):
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            data = file.file.read(MAX_FILE + 1)
+            if len(data) > MAX_FILE:
+                raise SourceError("上传文件超过 20 MiB。", 413)
+            with connect() as db, db.transaction():
+                actor = personal_writer(db, token)
+                library = personal_library(db, actor.id, create=True)
+                return queue_new_file(db, library, file.filename or "", data, title)
+        except ManagementError as error:
+            raise translate(error) from None
+
+    @routes.delete("/v1/knowledge/personal/{document}")
+    def delete_personal(document: UUID, token: Session):
+        try:
+            with connect() as db:
+                actor = member_actor(db, token)
+                owned_document(db, actor, document)
+                if not delete_document(db, str(document)):
+                    raise SourceError("找不到个人知识库中的此文档。", 404)
+        except ManagementError as error:
+            raise translate(error, 409) from None
+        return {"deleted": True}
+
+    @routes.put("/v1/knowledge/personal/{document}/availability")
+    def personal_visibility(document: UUID, payload: PersonalVisibility, token: Session):
+        try:
+            with connect() as db, db.transaction():
+                actor = member_actor(db, token)
+                owned_document(db, actor, document)
+                state = db.execute("""
+                    SELECT published, valid_until, valid_from FROM source_document
+                    WHERE platform='upload' AND document_id=%s FOR UPDATE
+                """, (str(document),)).fetchone()
+                if not state:
+                    raise SourceError("找不到个人知识库中的此文档。", 404)
+                was_published, until, start = state
+                return set_availability(db, str(document), str(payload.expected_version), was_published, until,
+                                        payload.published, until, start)
+        except ManagementError as error:
+            raise translate(error, 409) from None
 
     @routes.get("/v1/knowledge/personal/{document}")
     def personal_document(document: UUID, token: Session, response: Response, version: UUID | None = None):
@@ -237,12 +364,7 @@ def router(hybrid):
         response.headers["Cache-Control"] = "no-store"
         try:
             with connect() as db, db.transaction():
-                actor = member_actor(db, token)
-                permitted = db.execute("""
-                    SELECT 1 FROM member_account WHERE id=%s AND enabled AND personal_upload FOR UPDATE
-                """, (actor.id,)).fetchone()
-                if not permitted or member_actor(db, token) != actor:
-                    raise SourceError("你的账号尚未开通上传权限。", 403)
+                actor = personal_writer(db, token)
                 owned_document(db, actor, document)
                 return activate(db, str(document), version, payload.expected, hybrid)
         except ManagementError as error:

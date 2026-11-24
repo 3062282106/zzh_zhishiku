@@ -212,7 +212,7 @@ async function createLibrary() {
                   <td class="muted">{{ doc.owner || "未指定" }}</td>
                   <td class="muted">{{ fmtTime(doc.updated_at) }}</td>
                   <td class="right" @click.stop>
-                    <DocMenu :doc="doc" @changed="refreshDocs()" @open-doc="open(doc)" @history="openHistory(doc)" />
+                    <DocMenu :doc="doc" @changed="refreshDocs()" @deleted="refreshDocs()" @open-doc="open(doc)" @history="openHistory(doc)" />
                   </td>
                 </tr>
               </tbody>

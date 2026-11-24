@@ -323,12 +323,15 @@ def publish_personal_import(db, token, actor, source_id, document, version, hybr
     with db.transaction():
         if import_identity(db, token, lock=True) != actor:
             raise SourceError("上传权限已变更，请重试。", 403)
-        current, published, latest = db.execute("""
+        row = db.execute("""
             SELECT d.current_version, d.published, s.last_version_id
             FROM managed_source s JOIN source_document d
               ON d.platform=s.document_platform AND d.document_id=s.document_id
             WHERE s.id=%s FOR UPDATE OF d
         """, (source_id,)).fetchone()
+        if row is None:
+            raise SourceError("这份文档已删除。", 404)
+        current, published, latest = row
         if current == str(version) and published:
             return "published", current, None
         if latest != version:
@@ -385,8 +388,11 @@ def stage_feishu_import(db, token, url, target=None, heading=None, *, hybrid=Fal
     if actor.role == "member":
         status, live, publication_error = publish_personal_import(db, token, actor, source["id"], document, version, hybrid)
     else:
-        live, = db.execute("SELECT current_version FROM source_document WHERE platform='upload' AND document_id=%s",
-                          (document,)).fetchone()
+        row = db.execute("SELECT current_version FROM source_document WHERE platform='upload' AND document_id=%s",
+                         (document,)).fetchone()
+        if row is None:
+            raise SourceError("这份文档已删除。", 404)
+        live, = row
         status = "draft_created" if result["changed"] else "unchanged"
         publication_error = None
     outcome = {**result, "status": status, "published_version": live or None, "title": title, "library": name,

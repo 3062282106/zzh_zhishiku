@@ -1,14 +1,35 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { enc, feishuError, knowledgeApi } from "../api";
-import { fmtTime } from "../format";
+import { fmtTime, VISIBILITY } from "../format";
 import Drawer from "../components/Drawer.vue";
+import UploadDrawer from "../components/UploadDrawer.vue";
+import { confirmBox } from "../confirm";
 
 const route = useRoute();
 const router = useRouter();
 const status = ref(null);
 const files = ref([]);
+const jobs = ref([]);
+const uploadOpen = ref(false);
+let timer;
+let refreshPromise;
+const rows = computed(() => {
+  const latestJobs = new Map();
+  for (const job of jobs.value) {
+    if (!latestJobs.has(job.document_id)) latestJobs.set(job.document_id, job);
+  }
+  const result = files.value.map((doc) => ({ ...doc, job: latestJobs.get(doc.id) }));
+  const known = new Set(result.map((doc) => doc.id));
+  for (const [id, job] of latestJobs) {
+    if (!known.has(id)) result.push({ id, title: job.title, visibility_status: null, job });
+  }
+  return result;
+});
+const isProcessing = (job) => Boolean(job && (
+  ["queued", "parsing"].includes(job.status) || ["queued", "indexing"].includes(job.publication_status)
+));
 const selected = ref(null);
 const pending = ref(true);
 const busy = ref(false);
@@ -16,13 +37,74 @@ const error = ref("");
 const notice = ref("");
 const current = computed(() => selected.value?.versions.find((row) => row.id === selected.value.version));
 
+function loadFiles() {
+  refreshPromise ||= knowledgeApi("/personal").then((personal) => {
+    files.value = personal.documents;
+    jobs.value = personal.jobs;
+  }).finally(() => { refreshPromise = null; });
+  return refreshPromise;
+}
+
 async function load() {
-  const [personal, authorization] = await Promise.all([knowledgeApi("/personal"), knowledgeApi("/feishu/status")]);
-  files.value = personal.documents;
-  status.value = authorization;
+  await Promise.all([
+    loadFiles(),
+    knowledgeApi("/feishu/status").then((authorization) => { status.value = authorization; }),
+  ]);
+}
+
+function rowStatus(file) {
+  const job = file.job;
+  if (job?.status === "failed" || job?.publication_status === "failed") return "处理失败";
+  if (isProcessing(job)) return job.status === "ready" ? "正在建索引" : "正在解析";
+  if (file.visibility_status === "live") return "已发布";
+  return VISIBILITY[file.visibility_status] || "草稿";
+}
+
+async function uploaded() {
+  uploadOpen.value = false;
+  notice.value = "已提交，处理完成后自动发布。";
+  try {
+    await loadFiles();
+  } catch (problem) {
+    error.value = problem.message;
+  }
+}
+
+function remove(file) {
+  confirmBox({
+    title: "删除这份文档？", keys: file.title,
+    note: "文档、版本和上传原件将从你的个人知识库中删除。",
+    label: "确认删除", danger: true,
+    action: async () => {
+      await knowledgeApi("/personal/" + enc(file.id), { method: "DELETE" });
+      if (selected.value?.document === file.id) close();
+      notice.value = "文档已删除。";
+      await loadFiles();
+    },
+  });
+}
+
+async function switchVisibility(file) {
+  if (busy.value) return;
+  busy.value = true;
+  error.value = "";
+  try {
+    await knowledgeApi("/personal/" + enc(file.id) + "/availability", {
+      method: "PUT", body: { published: !file.published, expected_version: file.current_version },
+    });
+    notice.value = file.published ? "文档已下架。" : "文档已恢复上线。";
+    await loadFiles();
+  } catch (problem) {
+    error.value = problem.message;
+  } finally {
+    busy.value = false;
+  }
 }
 
 onMounted(async () => {
+  timer = setInterval(() => {
+    if (jobs.value.some(isProcessing)) loadFiles().catch(() => {});
+  }, 3000);
   try {
     const { feishu, document, version } = route.query;
     if (feishu) {
@@ -38,6 +120,7 @@ onMounted(async () => {
     pending.value = false;
   }
 });
+onUnmounted(() => clearInterval(timer));
 
 async function authorize() {
   if (busy.value) return;
@@ -99,29 +182,46 @@ async function publish() {
   <section>
     <header class="personal-head">
       <h1>个人知识库</h1>
-      <button v-if="status?.upload_enabled" class="btn" :disabled="busy" @click="authorize">
-        {{ status.authorized ? "重新授权飞书" : "授权飞书" }}
-      </button>
+      <div v-if="status?.upload_enabled" class="personal-actions">
+        <button class="btn" :disabled="busy" @click="authorize">
+          {{ status.authorized ? "重新授权飞书" : "授权飞书" }}
+        </button>
+        <button class="btn primary" :disabled="busy" @click="uploadOpen = true">上传文档</button>
+      </div>
     </header>
     <p v-if="notice" class="note" role="status">{{ notice }}</p>
     <p v-if="error && !selected" class="personal-error" role="alert">{{ error }}</p>
     <p v-if="pending" class="muted">正在加载…</p>
-    <p v-else-if="!files.length" class="note">
-      {{ status?.upload_enabled ? "在已连接知识库的 Agent 里发送飞书链接。导入完成后即可检索。" : "联系管理员开通个人库上传权限。" }}
+    <p v-else-if="!rows.length" class="note">
+      {{ status?.upload_enabled ? "上传文件，或在 Agent 中发送飞书链接。" : "联系管理员开通个人库上传权限。" }}
     </p>
     <div v-else class="card">
       <table>
         <thead><tr><th>文档</th><th>状态</th><th></th></tr></thead>
         <tbody>
-          <tr v-for="file in files" :key="file.id">
-            <td><b>{{ file.title }}</b></td>
-            <td><span class="pill" :class="file.current_version ? 'live' : 'draft'">{{ file.current_version ? "已发布" : "草稿" }}</span></td>
-            <td class="right"><button class="btn sm" :disabled="busy" @click="select(file.id)">查看</button></td>
+          <tr v-for="file in rows" :key="file.id">
+            <td>
+              <b>{{ file.title }}</b>
+              <div v-if="file.job?.last_error || file.job?.publication_error" class="t-sub">
+                {{ file.job.last_error || file.job.publication_error }}
+              </div>
+            </td>
+            <td><span class="pill" :class="file.visibility_status === 'live' ? 'live' : 'draft'">{{ rowStatus(file) }}</span></td>
+            <td class="right">
+              <div class="personal-actions">
+                <button v-if="file.visibility_status" class="btn sm" :disabled="busy" @click="select(file.id)">查看</button>
+                <button v-if="file.current_version" class="btn sm" :disabled="busy" @click="switchVisibility(file)">
+                  {{ file.published ? "下架" : "恢复" }}
+                </button>
+                <button class="btn sm danger" :disabled="busy" @click="remove(file)">删除</button>
+              </div>
+            </td>
           </tr>
         </tbody>
       </table>
     </div>
   </section>
+  <UploadDrawer v-if="uploadOpen" personal @close="uploadOpen = false" @uploaded="uploaded" />
   <Drawer v-if="selected" :title="selected.title" @close="close">
     <div class="field">
       <label for="personal-version">文档版本</label>
@@ -144,6 +244,7 @@ async function publish() {
 <style scoped>
 .personal-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .personal-head h1 { font-size: 26px; }
+.personal-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .personal-error { color: var(--red); margin: 12px 0; }
 .original { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.7; }
 </style>

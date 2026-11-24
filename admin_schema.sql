@@ -172,6 +172,17 @@ CREATE TABLE IF NOT EXISTS member_web_credential (
     CHECK ((password_hash IS NOT NULL AND setup_hash IS NULL AND setup_expires_at IS NULL)
         OR (password_hash IS NULL AND setup_hash IS NOT NULL AND setup_expires_at IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS managed_index_cleanup (
+    index_name text PRIMARY KEY CHECK (index_name ~ '^kb-local-(chunks|hybrid)-managed-[a-f0-9]{16}$'),
+    retry_after timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS managed_delete_event (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    document_id text NOT NULL,
+    library text NOT NULL REFERENCES knowledge_base(id),
+    title text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS feishu_user_authorization (
     role text NOT NULL CHECK (role IN ('member','admin')),
     account_id text NOT NULL,
