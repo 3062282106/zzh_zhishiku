@@ -180,21 +180,11 @@ function rollback(target) {
   });
 }
 
-async function onUploaded(result) {
+async function onUploaded() {
   uploadOpen.value = false;
-  if (result.job) {
-    toast("文件已上传，正在解析。");
-    await loadTasks().catch(fail);
-    router.push({ name: "tasks" });
-    return;
-  }
-  toast("处理完成后自动发布。");
-  await reload();
-  if (result.document_id === docId.value) {
-    await selectVersion(versions.value[0].id);
-  } else {
-    router.push({ name: "doc", params: { libraryId: libraryId.value, docId: result.document_id } });
-  }
+  toast("新版已提交，处理完成后自动发布。");
+  await loadTasks().catch(fail);
+  router.push({ name: "tasks" });
 }
 
 async function publish(target) {

@@ -89,25 +89,11 @@ function resetFilters() {
   pageNo.value = 1;
 }
 
-async function onUploaded(result) {
+async function onUploaded(count) {
   uploadOpen.value = false;
-  if (result.job) {
-    toast("文件已上传，正在解析。");
-    try {
-      await loadTasks();
-    } catch (error) {
-      fail(error);
-    }
-    router.push({ name: "tasks" });
-    return;
-  }
-  toast("处理完成后自动发布。");
-  try {
-    await Promise.all([loadDocs(libraryId.value), loadTasks()]);
-  } catch (error) {
-    fail(error);
-  }
-  router.push({ name: "doc", params: { libraryId: libraryId.value, docId: result.document_id } });
+  toast("已提交 " + count + " 份文档，处理完成后自动发布。");
+  await loadTasks().catch(fail);
+  router.push({ name: "tasks" });
 }
 
 async function createLibrary() {

@@ -2,9 +2,10 @@
 import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { auth } from "../auth";
-import { enc, knowledgeApi } from "../api";
+import { downloadKnowledgeFile, enc, isKnowledgeFile, knowledgeApi } from "../api";
 import { chunkWhere } from "../format";
 import Drawer from "../components/Drawer.vue";
+import MemberCatalog from "./MemberCatalog.vue";
 import PersonalLibrary from "./PersonalLibrary.vue";
 
 defineEmits(["logout"]);
@@ -47,23 +48,11 @@ async function openReference(item) {
   }
 }
 
-function internalSource(value) {
-  return /^\/v1\/knowledge\/(files|originals)\/[\da-f/-]+(?:#page=\d+)?$/i.test(value);
-}
-
 async function downloadSource(item) {
-  if (downloading.value || !internalSource(item.source_url)) return;
+  if (downloading.value) return;
   downloading.value = true;
   try {
-    const path = item.source_url.split("#")[0].slice("/v1/knowledge".length);
-    const response = await knowledgeApi(path, { raw: true });
-    const disposition = response.headers.get("content-disposition") || "";
-    const encoded = disposition.split("UTF-8''")[1];
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(await response.blob());
-    link.download = encoded ? decodeURIComponent(encoded) : item.title + ".txt";
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    await downloadKnowledgeFile(item.source_url, item.title);
   } catch (problem) {
     error.value = problem.message;
     selected.value = null;
@@ -103,6 +92,7 @@ async function downloadSource(item) {
           </article>
         </div>
         <p v-else-if="result" class="note" role="status">没有找到相关资料。</p>
+        <MemberCatalog />
       </template>
     </main>
   </div>
@@ -112,7 +102,7 @@ async function downloadSource(item) {
     <p class="snippet">{{ selected.snippet }}</p>
     <template #footer>
       <a v-if="selected.source_url.startsWith('https://')" :href="selected.source_url" target="_blank" rel="noopener noreferrer" class="btn">打开来源 ↗</a>
-      <button v-else-if="internalSource(selected.source_url)" class="btn" :disabled="downloading" @click="downloadSource(selected)">下载原文</button>
+      <button v-else-if="isKnowledgeFile(selected.source_url)" class="btn" :disabled="downloading" @click="downloadSource(selected)">下载原文</button>
     </template>
   </Drawer>
 </template>
@@ -121,11 +111,11 @@ async function downloadSource(item) {
 .member-page { min-height: 100vh; }
 .member-brand, .member-account, .search-box { display: flex; align-items: center; gap: 10px; }
 .member-account { color: var(--muted); font-size: 13px; }
-main { width: min(760px, calc(100% - 32px)); margin: 56px auto; }
+main { width: min(1000px, calc(100% - 32px)); margin: 34px auto; }
 h1 { margin-bottom: 16px; font-size: 26px; }
 .member-nav { display: flex; gap: 8px; margin-bottom: 20px; }
 .search-box { margin-bottom: 24px; }
-.search-box input { flex: 1; min-width: 0; height: 42px; }
+.search-box input { flex: 1; min-width: 0; height: 42px; padding: 0 12px; background: var(--surface); border: 1px solid var(--line-2); border-radius: 6px; }
 .search-box button { height: 42px; }
 .results { display: grid; gap: 12px; }
 h2 { font-size: 16px; }

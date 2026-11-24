@@ -31,18 +31,21 @@ PUBLISHED_AND_VALID = """
       AND (d.valid_from IS NULL OR d.valid_from <= statement_timestamp())
       AND (d.valid_until IS NULL OR d.valid_until > statement_timestamp())
 """
-MEMBER_VISIBLE_FROM = """
+MEMBER_LIBRARY_ACCESS = """
+    kb.owner_member_id = m.id OR
+    (kb.owner_member_id IS NULL AND g.kb_id IS NOT NULL AND g.revoked_at IS NULL
+     AND (g.expires_at IS NULL OR g.expires_at > statement_timestamp()))
+"""
+MEMBER_LIBRARIES_FROM = """
     FROM member_account m
     JOIN knowledge_base kb ON true
     LEFT JOIN knowledge_grant g ON g.member_id = m.id AND g.kb_id = kb.id
+"""
+MEMBER_VISIBLE_FROM = MEMBER_LIBRARIES_FROM + """
     JOIN source_document d ON d.kb_id = kb.id
     JOIN source_chunk c ON c.platform = d.platform
          AND c.document_id = d.document_id AND c.version = d.current_version
-    WHERE m.token_hash = %s AND m.enabled
-      AND (kb.owner_member_id = m.id OR
-           (kb.owner_member_id IS NULL AND g.kb_id IS NOT NULL AND g.revoked_at IS NULL
-            AND (g.expires_at IS NULL OR g.expires_at > statement_timestamp())))
-""" + PUBLISHED_AND_VALID
+    WHERE m.token_hash = %s AND m.enabled AND (""" + MEMBER_LIBRARY_ACCESS + ")" + PUBLISHED_AND_VALID
 ADMIN_VISIBLE_FROM = """
     FROM admin_import_token t
     JOIN admin_account a ON a.id = t.admin_id

@@ -32,7 +32,9 @@ FIELDS = """id, document_id, title, filename, status, attempts, last_error, crea
 
 
 def queue(db, library, document, title, filename, content, *, requested_by=None, auto_publish=False,
-          requires_mcp_grant=False):
+          requires_mcp_grant=False, upload_id=None):
+    if document is not None and upload_id is not None:
+        raise ManagementError("上传新版时不能指定批次上传编号。")
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv" or suffix in TEXT_SUFFIXES:
         if not 0 < len(content) <= MAX_FILE:
@@ -40,16 +42,18 @@ def queue(db, library, document, title, filename, content, *, requested_by=None,
         mime = TEXT_SUFFIXES.get(suffix, "text/csv")
     else:
         _, mime = validate_file(filename, content)
-    doc_id = str(document or uuid4())
+    doc_id = str(document or upload_id or uuid4())
     digest = sha256(content).hexdigest()
     with db.transaction():
         if not db.execute("SELECT 1 FROM knowledge_base WHERE id=%s", (library,)).fetchone():
             raise ManagementError("找不到目标知识库。")
+        created = False
         if document is None:
-            db.execute("""
+            created = db.execute("""
                 INSERT INTO source_document (platform, document_id, kb_id, current_version, published)
                 VALUES ('upload', %s, %s, '', false)
-            """, (doc_id, library))
+                ON CONFLICT (platform, document_id) DO NOTHING
+            """, (doc_id, library)).rowcount == 1
         row = db.execute("""
             SELECT kb_id FROM source_document WHERE platform='upload' AND document_id=%s FOR UPDATE
         """, (doc_id,)).fetchone()
@@ -58,13 +62,21 @@ def queue(db, library, document, title, filename, content, *, requested_by=None,
         if db.execute("SELECT 1 FROM managed_source WHERE document_id=%s", (doc_id,)).fetchone():
             raise ManagementError("在线来源请使用同步功能更新。")
         with db.cursor(row_factory=dict_row) as cur:
+            if upload_id is not None and not created:
+                previous = cur.execute("SELECT " + FIELDS + """
+                    FROM managed_file WHERE id=%s AND document_id=%s AND library=%s
+                      AND requested_by=%s AND digest=%s AND title=%s AND filename=%s
+                """, (upload_id, doc_id, library, requested_by, digest, title, filename)).fetchone()
+                if previous:
+                    return previous
+                raise ManagementError("这份文件已提交，请先刷新文档列表。")
             row = cur.execute("""
                 INSERT INTO managed_file (id, library, document_id, title, filename, content_type, content, digest,
                                           requested_by, auto_publish, requires_mcp_grant)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (library, document_id, digest, title) DO NOTHING
                 RETURNING """ + FIELDS,
-                (uuid4(), library, doc_id, title, filename, mime, content, digest, requested_by, auto_publish,
+                (upload_id or uuid4(), library, doc_id, title, filename, mime, content, digest, requested_by, auto_publish,
                  requires_mcp_grant)).fetchone()
             if row:
                 if requested_by:

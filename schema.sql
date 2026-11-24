@@ -34,3 +34,6 @@ CREATE TABLE IF NOT EXISTS source_chunk (
     version text NOT NULL,
     FOREIGN KEY (platform, document_id) REFERENCES source_document(platform, document_id)
 );
+CREATE INDEX IF NOT EXISTS source_document_by_library ON source_document(kb_id);
+CREATE INDEX IF NOT EXISTS source_chunk_by_document_version
+    ON source_chunk(platform, document_id, version, chunk_id);

@@ -29,6 +29,7 @@ const rows = computed(() => {
 });
 const isProcessing = (job) => Boolean(job && (
   ["queued", "parsing"].includes(job.status) || ["queued", "indexing"].includes(job.publication_status)
+  || (job.status === "ready" && job.auto_publish && !job.publication_status)
 ));
 const selected = ref(null);
 const pending = ref(true);
@@ -60,9 +61,9 @@ function rowStatus(file) {
   return VISIBILITY[file.visibility_status] || "草稿";
 }
 
-async function uploaded() {
+async function uploaded(count) {
   uploadOpen.value = false;
-  notice.value = "已提交，处理完成后自动发布。";
+  notice.value = "已提交 " + count + " 份文档，处理完成后自动发布。";
   try {
     await loadFiles();
   } catch (problem) {

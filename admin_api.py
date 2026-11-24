@@ -5,6 +5,7 @@ from pathlib import Path
 from secrets import compare_digest
 from time import monotonic
 from typing import Annotated, Literal
+from urllib.error import URLError
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -13,8 +14,8 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse,
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
 
-from access import (connect, is_member_web_token, member_web_identity, reader_digest, reader_id,
-                    reader_visibility, token_hash)
+from access import (MEMBER_LIBRARIES_FROM, MEMBER_LIBRARY_ACCESS, PUBLISHED_AND_VALID, connect,
+                    is_member_web_token, member_web_identity, reader_digest, reader_id, reader_visibility, token_hash)
 from admin import (ManagementError, WebLoginError, access_contact_url, activate, admin_directory, audit_feed,
                    close_session, create_admin, create_member, delete_document, documents, issue_member_web_setup, libraries,
                    member_directory, migrate, open_member_web_session, open_session, preview,
@@ -25,6 +26,8 @@ from feishu_source import bind_feishu, fetch_feishu_section
 from docling_parser import MAX_FILE, ParseError
 from file_ingest import SUPPORTED_SUFFIXES, jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
 from notion_source import SourceError, bind_notion, list_sources, sync_source
+from psycopg.rows import dict_row
+from search import catalog_metadata, lookup
 
 
 auth = HTTPBearer(auto_error=False)
@@ -100,6 +103,58 @@ def knowledge_file_digest(db, token):
     if not reader_id(db, token, digest):
         raise HTTPException(401, "无效的知识库令牌。")
     return digest
+
+
+def catalog_member(db, token):
+    migrate(db)
+    identity = member_web_identity(db, token)
+    if not identity:
+        raise HTTPException(401, "请登录成员账号。")
+    return identity[0]
+
+
+CATALOG_LIBRARIES = MEMBER_LIBRARIES_FROM + """
+    WHERE m.id=%s AND m.enabled AND kb.owner_member_id IS NULL AND (""" + MEMBER_LIBRARY_ACCESS + ")"
+
+CATALOG_DOCUMENTS = MEMBER_LIBRARIES_FROM + """
+    JOIN source_document d ON d.kb_id=kb.id
+    JOIN LATERAL (
+        SELECT c.chunk_id FROM source_chunk c
+        WHERE c.platform=d.platform AND c.document_id=d.document_id AND c.version=d.current_version
+        ORDER BY c.chunk_id LIMIT 1
+    ) first_chunk ON true
+    LEFT JOIN managed_version v ON v.platform=d.platform AND v.document_id=d.document_id
+        AND v.id::text=d.current_version
+    LEFT JOIN managed_source s ON s.document_platform=d.platform AND s.document_id=d.document_id
+    WHERE m.id=%s AND m.enabled AND kb.owner_member_id IS NULL AND (""" + MEMBER_LIBRARY_ACCESS + """
+    ) AND kb.id=%s
+""" + PUBLISHED_AND_VALID
+
+
+def catalog_rows(db, member, library, offset):
+    if not db.execute("SELECT 1 " + CATALOG_LIBRARIES + " AND kb.id=%s", (member, library)).fetchone():
+        raise HTTPException(404, "找不到可访问的知识库。")
+    with db.cursor(row_factory=dict_row) as cur:
+        return cur.execute("""
+            SELECT d.document_id AS id, d.platform, v.title, v.created_at AS updated_at,
+                   COALESCE(s.provider, d.platform) AS source, first_chunk.chunk_id
+        """ + CATALOG_DOCUMENTS + """
+            ORDER BY COALESCE(v.title, d.document_id), d.platform, d.document_id LIMIT 31 OFFSET %s
+        """, (member, library, offset)).fetchall()
+
+
+def catalog_preview(db, member, library, platform, document):
+    with db.cursor(row_factory=dict_row) as cur:
+        return cur.execute("""
+            SELECT v.title, v.filename, left(v.original, 24000) AS original,
+                   char_length(v.original) > 24000 AS truncated, s.source_url, first_chunk.chunk_id,
+                   CASE WHEN EXISTS (SELECT 1 FROM managed_file f WHERE f.id=v.id AND f.status='ready')
+                        THEN '/v1/knowledge/files/' || v.id::text
+                        WHEN v.id IS NOT NULL AND d.platform='upload' AND s.id IS NULL
+                        THEN '/v1/knowledge/originals/' || d.document_id || '/' || v.id::text
+                   END AS download_path
+        """ + CATALOG_DOCUMENTS + " AND d.platform=%s AND d.document_id=%s",
+            (member, library, platform, document)).fetchone()
 
 
 def enterprise_scope(request: Request):
@@ -548,9 +603,10 @@ def router(hybrid):
             raise HTTPException(error.status, str(error)) from None
 
     @control.post("/libraries/{library}/documents", status_code=201)
-    def add_version(library: str, title: Annotated[Title, Form()], file: Annotated[UploadFile, File()],
-                    identity: Annotated[dict, Depends(admin_identity)],
-                    document_id: Annotated[UUID | None, Form()] = None):
+    def add_version(library: str, file: Annotated[UploadFile, File()], identity: Annotated[dict, Depends(admin_identity)],
+                    title: Annotated[Title | None, Form()] = None,
+                    document_id: Annotated[UUID | None, Form()] = None,
+                    upload_id: Annotated[UUID | None, Form()] = None):
         filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
         if len(filename) > 200 or Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
             raise HTTPException(422, "请选择 PDF、DOCX、XLSX、CSV、PPTX、扫描图片、Markdown 或 TXT。")
@@ -559,8 +615,8 @@ def router(hybrid):
             raise HTTPException(413, "上传文件超过 20 MiB。")
         try:
             with connect() as db:
-                return {"job": queue_file(db, library, document_id, title, filename, data,
-                                          requested_by=identity["id"], auto_publish=True)}
+                return {"job": queue_file(db, library, document_id, title or Path(filename).stem[:160], filename, data,
+                                          requested_by=identity["id"], auto_publish=True, upload_id=upload_id)}
         except (ManagementError, ParseError) as error:
             raise HTTPException(422, str(error)) from None
 
@@ -641,6 +697,50 @@ def router(hybrid):
                                 rollback=action == "rollback", schedule=schedule, actor_id=identity["id"])
         except ManagementError as error:
             raise HTTPException(409, str(error)) from None
+
+    @routes.get("/v1/knowledge/libraries")
+    def visible_libraries(token: Annotated[str, Depends(reader_identity)], response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db, db.cursor(row_factory=dict_row) as cur:
+            member = catalog_member(db, token)
+            return cur.execute("SELECT kb.id, kb.name " + CATALOG_LIBRARIES + " ORDER BY kb.name, kb.id",
+                               (member,)).fetchall()
+
+    @routes.get("/v1/knowledge/libraries/{library}/documents")
+    def visible_documents(library: str, token: Annotated[str, Depends(reader_identity)], response: Response,
+                          offset: Annotated[int, Query(ge=0)] = 0):
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db:
+            rows = catalog_rows(db, catalog_member(db, token), library, offset)
+        items = rows[:30]
+        try:
+            titles = catalog_metadata([row["chunk_id"] for row in items if row["title"] is None])
+        except (URLError, OSError):
+            titles = {}
+        for row in items:
+            chunk_id = row.pop("chunk_id")
+            row["title"] = row["title"] or titles.get(chunk_id) or "未命名文档"
+        return {"items": items, "next_offset": offset + 30 if len(rows) > 30 else None}
+
+    @routes.get("/v1/knowledge/libraries/{library}/documents/{platform}/{document}")
+    def visible_document(library: str, platform: str, document: str,
+                         token: Annotated[str, Depends(reader_identity)], response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        with connect() as db:
+            row = catalog_preview(db, catalog_member(db, token), library, platform, document)
+        if row is None:
+            raise HTTPException(404, "找不到可访问的文档。")
+        chunk_id = row.pop("chunk_id")
+        if row["title"] is not None:
+            return row
+        try:
+            item = lookup(chunk_id, {chunk_id})
+        except (URLError, OSError):
+            raise HTTPException(503, "暂时无法加载此文档。") from None
+        if not item:
+            raise HTTPException(404, "找不到此文档的在线预览。")
+        return {**row, "title": item["title"], "original": item["text"], "truncated": True,
+                "source_url": item.get("source_url") or item.get("reference_url")}
 
     @routes.get("/v1/knowledge/originals/{document}/{version}")
     def original(document: UUID, version: UUID, token: Annotated[str, Depends(reader_identity)]):

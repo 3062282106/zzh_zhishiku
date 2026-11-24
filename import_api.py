@@ -137,13 +137,14 @@ def personal_writer(db, token):
     return actor
 
 
-def queue_new_file(db, library, filename, content, actor, title=None, *, via_mcp=False):
+def queue_new_file(db, library, filename, content, actor, title=None, *, via_mcp=False, upload_id=None):
     filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
     if len(filename) > 200 or Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
         raise SourceError("请选择 PDF、DOCX、XLSX、CSV、PPTX、扫描图片、Markdown 或 TXT。", 422)
     try:
         return queue_file(db, library, None, title or Path(filename).stem[:160], filename, content,
-                          requested_by=actor.id, auto_publish=True, requires_mcp_grant=via_mcp and actor.role == "admin")
+                          requested_by=actor.id, auto_publish=True, requires_mcp_grant=via_mcp and actor.role == "admin",
+                          upload_id=upload_id)
     except ParseError as error:
         raise SourceError(str(error), 422) from None
 
@@ -306,7 +307,8 @@ def router(hybrid):
 
     @routes.post("/v1/knowledge/personal/files", status_code=202)
     def upload_personal(token: Session, response: Response, file: Annotated[UploadFile, File()],
-                        title: Annotated[Title, Form()]):
+                        title: Annotated[Title | None, Form()] = None,
+                        upload_id: Annotated[UUID | None, Form()] = None):
         response.headers["Cache-Control"] = "no-store"
         try:
             data = file.file.read(MAX_FILE + 1)
@@ -315,7 +317,7 @@ def router(hybrid):
             with connect() as db, db.transaction():
                 actor = personal_writer(db, token)
                 library = personal_library(db, actor.id, create=True)
-                return queue_new_file(db, library, file.filename or "", data, actor, title)
+                return queue_new_file(db, library, file.filename or "", data, actor, title, upload_id=upload_id)
         except ManagementError as error:
             raise translate(error) from None
 

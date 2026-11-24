@@ -71,3 +71,20 @@ export const api = (path, options) => request("/v1/admin" + path, options);
 export const sessionApi = (path, options) => request("/v1/session" + path, options);
 export const knowledgeApi = (path, options) => request("/v1/knowledge" + path, options);
 export const enc = (value) => encodeURIComponent(String(value));
+
+export function isKnowledgeFile(value) {
+  return /^\/v1\/knowledge\/(files|originals)\/[\da-f/-]+(?:#page=\d+)?$/i.test(value);
+}
+
+export async function downloadKnowledgeFile(source, title) {
+  if (!isKnowledgeFile(source)) return;
+  const path = source.split("#")[0].slice("/v1/knowledge".length);
+  const response = await knowledgeApi(path, { raw: true });
+  const disposition = response.headers.get("content-disposition") || "";
+  const encoded = disposition.split("UTF-8''")[1];
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(await response.blob());
+  link.download = encoded ? decodeURIComponent(encoded) : title + ".txt";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}

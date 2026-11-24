@@ -162,6 +162,17 @@ def lookup(chunk_id, allowed_ids):
     return hits[0]["_source"] if hits else None
 
 
+def catalog_metadata(chunk_ids):
+    if not chunk_ids:
+        return {}
+    result = request("POST", search_path(ALIAS), {
+        "size": len(chunk_ids),
+        "_source": ["title"],
+        "query": {"ids": {"values": chunk_ids}},
+    })
+    return {hit["_id"]: hit["_source"]["title"] for hit in result["hits"]["hits"] if hit["_source"].get("title")}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Index the approved local source snapshot.")
     commands = parser.add_subparsers(dest="command", required=True)
