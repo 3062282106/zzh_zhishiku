@@ -17,7 +17,8 @@ from access import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from admin import ManagementError, activate, build_indexes, index_errors, markdown_chunks, migrate, save_version
+from admin import (ManagementError, activate, build_indexes, index_errors, markdown_chunks,
+                   migrate, record_ingest, save_version)
 import search
 from docling_parser import FORMATS, MAX_FILE, ParseError, evidence, result, submit, validate_file
 
@@ -27,10 +28,11 @@ QUEUED_SUFFIXES = FORMATS.keys() | {".csv"}
 TEXT_SUFFIXES = {".md": "text/markdown", ".txt": "text/plain"}
 SUPPORTED_SUFFIXES = QUEUED_SUFFIXES | TEXT_SUFFIXES.keys()
 FIELDS = """id, document_id, title, filename, status, attempts, last_error, created_at,
-            publication_status, publication_error"""
+            publication_status, publication_error, auto_publish"""
 
 
-def queue(db, library, document, title, filename, content):
+def queue(db, library, document, title, filename, content, *, requested_by=None, auto_publish=False,
+          requires_mcp_grant=False):
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv" or suffix in TEXT_SUFFIXES:
         if not 0 < len(content) <= MAX_FILE:
@@ -57,11 +59,16 @@ def queue(db, library, document, title, filename, content):
             raise ManagementError("在线来源请使用同步功能更新。")
         with db.cursor(row_factory=dict_row) as cur:
             row = cur.execute("""
-                INSERT INTO managed_file (id, library, document_id, title, filename, content_type, content, digest)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO managed_file (id, library, document_id, title, filename, content_type, content, digest,
+                                          requested_by, auto_publish, requires_mcp_grant)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (library, document_id, digest, title) DO NOTHING
-                RETURNING """ + FIELDS, (uuid4(), library, doc_id, title, filename, mime, content, digest)).fetchone()
+                RETURNING """ + FIELDS,
+                (uuid4(), library, doc_id, title, filename, mime, content, digest, requested_by, auto_publish,
+                 requires_mcp_grant)).fetchone()
             if row:
+                if requested_by:
+                    record_ingest(db, "file", row["id"], library, requested_by, title)
                 return row
             return cur.execute("SELECT " + FIELDS + """
                 FROM managed_file WHERE library=%s AND document_id=%s AND digest=%s AND title=%s
@@ -92,7 +99,7 @@ def retry(db, job_id):
     return job
 
 
-def queue_publication(db, document, version, expected, valid_from=None, valid_until=None):
+def queue_publication(db, document, version, expected, valid_from=None, valid_until=None, *, actor_id=None):
     if valid_from and valid_until and valid_until <= valid_from:
         raise ManagementError("到期时间必须晚于生效时间。")
     with db.transaction(), db.cursor(row_factory=dict_row) as cur:
@@ -116,9 +123,10 @@ def queue_publication(db, document, version, expected, valid_from=None, valid_un
         cur.execute("""
             UPDATE managed_file SET publication_status='queued', publication_expected=%s,
                 publication_previous_live=%s, publication_previous_until=%s, publication_requested_at=now(),
-                publication_error=NULL, publication_valid_from=%s, publication_valid_until=%s
+                publication_error=NULL, publication_valid_from=%s, publication_valid_until=%s,
+                publication_actor_id=COALESCE(%s, requested_by)
             WHERE id=%s
-        """, (expected, row["published"], row["valid_until"], valid_from, valid_until, version))
+        """, (expected, row["published"], row["valid_until"], valid_from, valid_until, actor_id, version))
     return {"publication_status": "queued"}
 
 
@@ -142,18 +150,44 @@ def clean_deleted_index(db):
     return True
 
 
+def queue_next_automatic_publication(db):
+    row = db.execute("""
+        SELECT f.document_id, f.id, d.current_version
+        FROM managed_file f JOIN source_document d ON d.platform='upload' AND d.document_id=f.document_id
+        JOIN knowledge_base k ON k.id=f.library
+        WHERE f.status='ready' AND f.publication_status IS NULL AND (f.auto_publish OR k.owner_member_id IS NOT NULL)
+          AND NOT EXISTS (
+            SELECT 1 FROM managed_file busy WHERE busy.document_id=f.document_id
+              AND busy.publication_status IN ('queued','indexing')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM managed_file newer WHERE newer.document_id=f.document_id
+              AND (newer.created_at, newer.id) > (f.created_at, f.id)
+              AND newer.status <> 'failed' AND (newer.auto_publish OR k.owner_member_id IS NOT NULL)
+          )
+        ORDER BY f.created_at, f.id LIMIT 1
+    """).fetchone()
+    if row:
+        try:
+            queue_publication(db, *row)
+        except ManagementError:
+            return
+
+
 def publish_next(db, hybrid):
     lock_id = 5620191339462067150
     if not db.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,)).fetchone()[0]:
         return False
     try:
         cleaned = clean_deleted_index(db)
+        queue_next_automatic_publication(db)
         with db.cursor(row_factory=dict_row) as cur:
             job = cur.execute("""
                 UPDATE managed_file SET publication_status='indexing'
                 WHERE id=(SELECT id FROM managed_file WHERE publication_status IN ('queued','indexing')
                           ORDER BY publication_requested_at LIMIT 1)
-                RETURNING id, library, document_id, publication_expected, publication_previous_live,
+                RETURNING id, library, document_id, requested_by, requires_mcp_grant, publication_actor_id,
+                          publication_expected, publication_previous_live,
                           publication_previous_until, publication_valid_from, publication_valid_until
             """).fetchone()
         if not job:
@@ -174,9 +208,17 @@ def publish_next(db, hybrid):
                     SELECT 1 FROM member_account WHERE id=%s AND enabled AND personal_upload FOR UPDATE
                 """, (owner,)).fetchone():
                     raise ManagementError("个人知识库上传权限已撤销。")
+                if job["requires_mcp_grant"]:
+                    active_admin = db.execute("""
+                        SELECT 1 FROM admin_account WHERE id=%s AND enabled FOR UPDATE
+                    """, (job["requested_by"],)).fetchone()
+                    if not active_admin or not db.execute("""
+                        SELECT 1 FROM admin_upload_grant WHERE admin_id=%s AND library=%s
+                    """, (job["requested_by"], job["library"])).fetchone():
+                        raise ManagementError("此企业库的 MCP 上传授权已撤销。")
                 activate(db, job["document_id"], version, job["publication_expected"], hybrid, prepared=prepared,
                          availability=(job["publication_previous_live"], job["publication_previous_until"]),
-                         schedule=schedule)
+                         schedule=schedule, actor_id=job["publication_actor_id"] or owner)
                 db.execute("UPDATE managed_file SET publication_status='published' WHERE id=%s", (version,))
         except ManagementError as error:
             db.execute("UPDATE managed_file SET publication_status='failed', publication_error=%s WHERE id=%s",
@@ -307,12 +349,6 @@ def finish(db, job, parsed):
             UPDATE managed_file SET status='ready', parser_document=%s, last_error=NULL, lease=NULL, lease_until=NULL
             WHERE id=%s
         """, (Jsonb(structured), job["id"]))
-        owner, = db.execute("SELECT owner_member_id FROM knowledge_base WHERE id=%s", (job["library"],)).fetchone()
-        if owner:
-            current, = db.execute("""
-                SELECT current_version FROM source_document WHERE platform='upload' AND document_id=%s
-            """, (job["document_id"],)).fetchone()
-            queue_publication(db, job["document_id"], job["id"], current)
 
 
 def tick(db):

@@ -1,0 +1,1 @@
+import{c as t,d as a,g as n,t as o,h as r,S as c}from"./index-2-gAatAo.js";const l={class:"empty"},i={key:0},u={__name:"EmptyState",props:{title:{type:String,required:!0},note:{type:String,default:""}},setup(e){return(s,d)=>(t(),a("div",l,[n("b",null,o(e.title),1),e.note?(t(),a("p",i,o(e.note),1)):r("",!0),c(s.$slots,"default")]))}};export{u as _};

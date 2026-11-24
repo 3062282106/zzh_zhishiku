@@ -23,7 +23,7 @@ from admin_api import Title, admin_identity, reader_identity
 from agent_import import (CALLBACK, OAuthFailure, admin_import_access, begin_oauth, complete_oauth,
                           console_path, import_identity, issue_admin_import_token, oauth_requests,
                           personal_library, set_admin_import_access, stage_feishu_import, target_library,
-                          upload_enabled, user_token, web_importer)
+                          upload_enabled, uploadable_libraries, user_token, web_importer)
 from docling_parser import MAX_FILE, ParseError
 from feishu_source import parse_link
 from file_ingest import SUPPORTED_SUFFIXES, file_status, jobs as file_jobs, queue as queue_file
@@ -87,8 +87,7 @@ def import_outcome(job_id, job):
         return {"status": "processing", "job_id": str(job_id), "message": "正在后台导入，可查询任务进度。"}
 
 
-MAX_MCP_FILE = 5 * 1024 * 1024
-MAX_BASE64 = 4 * ((MAX_MCP_FILE + 2) // 3)
+MAX_BASE64 = 4 * ((MAX_FILE + 2) // 3)
 
 
 class FileImport(BaseModel):
@@ -138,12 +137,13 @@ def personal_writer(db, token):
     return actor
 
 
-def queue_new_file(db, library, filename, content, title=None):
+def queue_new_file(db, library, filename, content, actor, title=None, *, via_mcp=False):
     filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
     if len(filename) > 200 or Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
         raise SourceError("请选择 PDF、DOCX、XLSX、CSV、PPTX、扫描图片、Markdown 或 TXT。", 422)
     try:
-        return queue_file(db, library, None, title or Path(filename).stem[:160], filename, content)
+        return queue_file(db, library, None, title or Path(filename).stem[:160], filename, content,
+                          requested_by=actor.id, auto_publish=True, requires_mcp_grant=via_mcp and actor.role == "admin")
     except ParseError as error:
         raise SourceError(str(error), 422) from None
 
@@ -187,6 +187,16 @@ def router(hybrid):
         except SourceError as error:
             raise translate(error) from None
 
+    @routes.get("/v1/knowledge/imports/libraries")
+    def list_import_libraries(token: Session, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            with connect() as db:
+                actor = import_identity(db, token)
+                return {"role": actor.role, "libraries": uploadable_libraries(db, actor)}
+        except SourceError as error:
+            raise translate(error) from None
+
     @routes.post("/v1/knowledge/imports/files", status_code=202)
     def import_mcp_file(payload: FileImport, token: Session, response: Response):
         response.headers["Cache-Control"] = "no-store"
@@ -198,11 +208,11 @@ def router(hybrid):
                     data = b64decode(payload.content_base64, validate=True)
                 except (Base64Error, ValueError):
                     raise SourceError("附件内容不是有效的 Base64。", 422) from None
-                if len(data) > MAX_MCP_FILE:
-                    raise SourceError("MCP 支持 5 MiB 以内的附件。更大的文件请在知识库网页上传。", 413)
+                if len(data) > MAX_FILE:
+                    raise SourceError("上传文件超过 20 MiB。", 413)
                 if actor.role == "member":
                     library = personal_library(db, actor.id, create=True)
-                return queue_new_file(db, library, payload.filename, data, payload.title)
+                return queue_new_file(db, library, payload.filename, data, actor, payload.title, via_mcp=True)
         except ManagementError as error:
             raise translate(error) from None
 
@@ -305,7 +315,7 @@ def router(hybrid):
             with connect() as db, db.transaction():
                 actor = personal_writer(db, token)
                 library = personal_library(db, actor.id, create=True)
-                return queue_new_file(db, library, file.filename or "", data, title)
+                return queue_new_file(db, library, file.filename or "", data, actor, title)
         except ManagementError as error:
             raise translate(error) from None
 
@@ -315,7 +325,7 @@ def router(hybrid):
             with connect() as db:
                 actor = member_actor(db, token)
                 owned_document(db, actor, document)
-                if not delete_document(db, str(document)):
+                if not delete_document(db, str(document), actor_id=actor.id):
                     raise SourceError("找不到个人知识库中的此文档。", 404)
         except ManagementError as error:
             raise translate(error, 409) from None
@@ -335,7 +345,7 @@ def router(hybrid):
                     raise SourceError("找不到个人知识库中的此文档。", 404)
                 was_published, until, start = state
                 return set_availability(db, str(document), str(payload.expected_version), was_published, until,
-                                        payload.published, until, start)
+                                        payload.published, until, start, actor_id=actor.id)
         except ManagementError as error:
             raise translate(error, 409) from None
 
@@ -366,7 +376,7 @@ def router(hybrid):
             with connect() as db, db.transaction():
                 actor = personal_writer(db, token)
                 owned_document(db, actor, document)
-                return activate(db, str(document), version, payload.expected, hybrid)
+                return activate(db, str(document), version, payload.expected, hybrid, actor_id=actor.id)
         except ManagementError as error:
             raise translate(error, 409) from None
 

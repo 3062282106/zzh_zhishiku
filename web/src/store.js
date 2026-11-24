@@ -8,6 +8,7 @@ export const store = reactive({
   sources: [],
   tasks: [],
   members: [],
+  operationAdmins: [],
   audit: [],
   probeMember: "",
   // Deployment-specific values that must not be baked into the bundle, e.g. the
@@ -56,6 +57,11 @@ export async function loadMembers() {
   return store.members;
 }
 
+export async function loadOperationAdmins() {
+  const rows = await api("/administrators");
+  store.operationAdmins = rows.map((item) => ({ ...item, name: item.display_name || item.username }));
+}
+
 export async function loadAudit() {
   store.audit = await api("/audit?limit=300");
   return store.audit;
@@ -87,6 +93,7 @@ export function resetStore() {
   store.sources = [];
   store.tasks = [];
   store.members = [];
+  store.operationAdmins = [];
   store.audit = [];
   store.probeMember = "";
 }

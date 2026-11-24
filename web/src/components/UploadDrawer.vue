@@ -81,7 +81,7 @@ async function upload() {
       <input ref="picker" type="file" hidden :accept="ACCEPT" @change="choose">
     </div>
     <div class="note">
-      {{ personal ? "处理完成后自动发布。" : documentId ? "上传后会生成新草稿，核对分块后再发布。" : "上传后自动解析；解析完成会出现在处理任务里，可直接打开草稿。" }}
+      处理完成后自动发布。单个文件最大 20 MiB。
     </div>
     <template #footer>
       <button class="btn" @click="$emit('close')">取消</button>

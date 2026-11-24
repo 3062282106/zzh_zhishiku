@@ -2,21 +2,26 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import PageHead from "../components/PageHead.vue";
+import MemberFilter from "../components/MemberFilter.vue";
 import EmptyState from "../components/EmptyState.vue";
 import StatusPill from "../components/StatusPill.vue";
 import { api, enc } from "../api";
-import { store, loadTasks } from "../store";
 import { TASK_KIND, TASK_STATE } from "../format";
 import { toast, fail } from "../toast";
 
 const router = useRouter();
 const filter = ref("all");
+const member = ref("");
+const tasks = ref([]);
+const loading = ref(false);
+let request;
+let mounted = false;
 const busyId = ref("");
 let timer = 0;
 
 const counts = computed(() => {
-  const value = { all: store.tasks.length, running: 0, failed: 0, done: 0 };
-  for (const task of store.tasks) {
+  const value = { all: tasks.value.length, running: 0, failed: 0, done: 0 };
+  for (const task of tasks.value) {
     if (task.status === "running" || task.status === "queued") value.running++;
     else if (task.status === "failed") value.failed++;
     else value.done++;
@@ -25,7 +30,7 @@ const counts = computed(() => {
 });
 
 const rows = computed(() =>
-  store.tasks.filter((task) => {
+  tasks.value.filter((task) => {
     if (filter.value === "running") return task.status === "running" || task.status === "queued";
     if (filter.value === "failed") return task.status === "failed";
     if (filter.value === "done") return task.status === "done";
@@ -36,7 +41,7 @@ const rows = computed(() =>
 const TABS = [["all", "全部"], ["running", "处理中"], ["failed", "失败"], ["done", "已完成"]];
 
 /** Jobs nobody has touched for five minutes: the parser is down, not slow. */
-const stalled = computed(() => store.tasks.filter((task) => task.stalled));
+const stalled = computed(() => tasks.value.filter((task) => task.stalled));
 
 function waited(seconds) {
   const value = Number(seconds) || 0;
@@ -53,13 +58,13 @@ function resultText(task) {
   if (task.status === "running") {
     return task.kind === "parse" ? "正在解析原文" : "正在构建索引";
   }
-  if (task.kind === "parse") return "解析完成 · 草稿已就绪";
+  if (task.kind === "parse") return task.auto_publish ? "解析完成，进入自动发布" : "解析完成，草稿已就绪";
   if (task.kind === "publish") return "索引已切换，发布完成";
-  return "已检查，未发现变化";
+  return task.user_imported ? "飞书内容已导入" : "同步完成";
 }
 
 function openDoc(task) {
-  if (!task.document_id) return toast("这个任务没有关联文档。");
+  if (task.personal || !task.document_id) return;
   // A parse job has no version yet, so there is nothing to preview until it is done.
   if (task.kind === "parse" && task.status !== "done") {
     return toast("文件还没解析完成，暂时没有可预览的文档。");
@@ -93,10 +98,34 @@ async function retry(task) {
   }
 }
 
+async function loadTasks() {
+  request?.abort();
+  const controller = new AbortController();
+  request = controller;
+  loading.value = true;
+  const params = new URLSearchParams({ days: "30" });
+  if (member.value) params.set("member", member.value);
+  try {
+    const next = await api("/tasks?" + params, { signal: controller.signal });
+    if (request === controller) tasks.value = next;
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+  } finally {
+    if (request === controller) loading.value = false;
+  }
+}
+
+async function changeMember(id) {
+  member.value = id;
+  filter.value = "all";
+  clearTimeout(timer);
+  await loadTasks().then(schedule).catch(fail);
+}
+
 /** Keep polling only while something is actually moving. */
 function schedule() {
   clearTimeout(timer);
-  if (!store.tasks.some((task) => task.status === "running" || task.status === "queued")) return;
+  if (!mounted || !tasks.value.some((task) => task.status === "running" || task.status === "queued")) return;
   timer = setTimeout(async () => {
     try {
       await loadTasks();
@@ -108,6 +137,7 @@ function schedule() {
 }
 
 onMounted(async () => {
+  mounted = true;
   try {
     await loadTasks();
   } catch (error) {
@@ -115,12 +145,16 @@ onMounted(async () => {
   }
   schedule();
 });
-onUnmounted(() => clearTimeout(timer));
+onUnmounted(() => {
+  mounted = false;
+  clearTimeout(timer);
+  request?.abort();
+});
 </script>
 
 <template>
   <div class="wrap">
-    <PageHead title="处理任务" subtitle="解析、同步与发布任务集中处理">
+    <PageHead title="处理任务">
       <button class="btn" @click="loadTasks().then(schedule).catch(fail)">刷新</button>
     </PageHead>
 
@@ -132,30 +166,36 @@ onUnmounted(() => clearTimeout(timer));
     </div>
 
     <div class="card">
-      <div class="filters" style="gap:6px">
+      <div class="filters task-filters">
+        <MemberFilter :model-value="member" @update:model-value="changeMember" />
+        <div class="task-tabs" aria-label="任务状态">
         <button v-for="[key, label] in TABS" :key="key" class="chip" :class="{ on: filter === key }"
                 @click="filter = key">{{ label }}{{ key === "all" ? "" : " · " + counts[key] }}</button>
+        </div>
       </div>
 
-      <EmptyState v-if="!rows.length"
+      <p v-if="loading && !rows.length" class="loading" role="status">正在加载…</p>
+      <EmptyState v-else-if="!rows.length"
                   :title="filter === 'failed' ? '没有失败任务' : '暂无任务'"
                   :note="filter === 'failed' ? '所有解析、同步与发布任务都已处理完成。' : '上传文件或同步来源后，任务会出现在这里。'" />
 
       <template v-else>
+        <div class="tasks-table">
         <table>
           <colgroup>
-            <col style="width:29%"><col style="width:9%"><col style="width:11%">
-            <col style="width:33%"><col style="width:18%">
+            <col style="width:24%"><col style="width:15%"><col style="width:9%">
+            <col style="width:12%"><col style="width:25%"><col style="width:15%">
           </colgroup>
           <thead>
-            <tr><th>任务 / 文档</th><th>类型</th><th>状态</th><th>失败原因 / 处理结果</th><th></th></tr>
+            <tr><th>任务 / 知识库</th><th>成员</th><th>类型</th><th>状态</th><th>处理结果</th><th></th></tr>
           </thead>
           <tbody>
             <tr v-for="task in rows" :key="task.id || task.job_id || task.version_id" @click="openDoc(task)">
               <td>
                 <div class="t-main">{{ task.title }}</div>
-                <div class="t-sub mono">{{ task.version_id ? "#" + String(task.version_id).slice(0, 8) : (task.filename || "") }}</div>
+                <div v-if="!task.personal" class="t-sub">{{ task.library_name }}</div>
               </td>
+              <td>{{ task.member_name || '—' }}</td>
               <td class="muted">{{ TASK_KIND[task.kind] || task.kind }}</td>
               <td><StatusPill :status="task.status" :label="TASK_STATE[task.status] || task.status" /></td>
               <td :class="{ muted: task.status !== 'failed' && !task.stalled }">
@@ -163,15 +203,23 @@ onUnmounted(() => clearTimeout(timer));
               </td>
               <td class="right" @click.stop>
                 <div style="display:flex;gap:8px;justify-content:flex-end">
-                  <button v-if="task.status === 'failed'" class="btn link" :disabled="busyId !== ''" @click="retry(task)">重试</button>
-                  <button v-if="task.kind !== 'parse' || task.status === 'done'" class="btn link" @click="openDoc(task)">打开文档</button>
+                  <button v-if="!task.personal && task.status === 'failed' && !task.user_imported" class="btn link" :disabled="busyId !== ''" @click="retry(task)">重试</button>
+                  <button v-if="!task.personal && (task.kind !== 'parse' || task.status === 'done')" class="btn link" @click="openDoc(task)">打开文档</button>
                 </div>
               </td>
             </tr>
           </tbody>
         </table>
+        </div>
         <div class="table-foot"><span>共 {{ rows.length }} 项任务 · 最近 30 天</span><span></span></div>
       </template>
+
+<style scoped>
+.task-filters { justify-content: space-between; gap: 8px 16px; }
+.task-tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+.tasks-table { overflow-x: auto; }
+.tasks-table table { min-width: 760px; }
+</style>
     </div>
   </div>
 </template>

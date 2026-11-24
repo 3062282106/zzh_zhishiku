@@ -313,7 +313,7 @@ def preview(db, document, version):
 
 
 def set_availability(db, document, expected, expected_published, expected_valid_until, published, valid_until,
-                     valid_from=None):
+                     valid_from=None, *, actor_id=None):
     with db.transaction(), db.cursor(row_factory=dict_row) as cur:
         row = cur.execute("""
             SELECT current_version, published, valid_from, valid_until
@@ -337,10 +337,10 @@ def set_availability(db, document, expected, expected_published, expected_valid_
             cur.execute("""
                 INSERT INTO managed_availability_event
                     (document_id, version_id, was_published, published, previous_valid_until, valid_until,
-                     previous_valid_from, valid_from)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     previous_valid_from, valid_from, actor_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (document, expected, row["published"], published, row["valid_until"], valid_until,
-                  row["valid_from"], valid_from))
+                  row["valid_from"], valid_from, actor_id))
     return {"published": published, "valid_until": valid_until, "valid_from": valid_from}
 
 
@@ -382,7 +382,15 @@ def upload(db, library, document, title, filename, original, metadata=None, *,
                         online=source_url is not None, create=create)
 
 
-def delete_document(db, document):
+def record_ingest(db, kind, origin_id, library, actor_id, title):
+    db.execute("""
+        INSERT INTO knowledge_ingest_event (kind, origin_id, library, actor_id, title)
+        SELECT %s, %s, k.id, %s, CASE WHEN k.owner_member_id IS NULL THEN %s END
+        FROM knowledge_base k WHERE k.id=%s ON CONFLICT DO NOTHING
+    """, (kind, origin_id, actor_id, title, library))
+
+
+def delete_document(db, document, *, actor_id=None):
     with db.transaction():
         db.execute("SELECT id FROM managed_source WHERE document_platform='upload' AND document_id=%s FOR UPDATE",
                    (document,)).fetchall()
@@ -397,15 +405,15 @@ def delete_document(db, document):
         if any(state == "indexing" for state, in jobs):
             raise ManagementError("文档正在构建索引，完成后可以删除。")
         db.execute("""
-            INSERT INTO managed_delete_event (document_id, library, title)
-            SELECT %s, %s, COALESCE(
+            INSERT INTO managed_delete_event (document_id, library, actor_id, title)
+            SELECT %s, %s, %s, COALESCE(
                 (SELECT title FROM managed_version WHERE platform='upload' AND document_id=%s
                  ORDER BY created_at DESC LIMIT 1),
                 (SELECT title FROM managed_file WHERE document_id=%s ORDER BY created_at DESC LIMIT 1),
                 (SELECT title FROM managed_source WHERE document_platform='upload' AND document_id=%s),
                 '文档')
             WHERE EXISTS (SELECT 1 FROM knowledge_base WHERE id=%s AND owner_member_id IS NULL)
-        """, (document, row[0], document, document, document, row[0]))
+        """, (document, row[0], actor_id, document, document, document, row[0]))
         db.execute("""
             INSERT INTO managed_index_cleanup (index_name)
             SELECT DISTINCT i.name FROM managed_version v
@@ -483,7 +491,7 @@ def index_errors(db, version):
 
 
 def activate(db, document, version, expected, hybrid, rollback=False, *, prepared=None, availability=None,
-             schedule=None):
+             schedule=None, actor_id=None):
     with index_errors(db, version), db.transaction(), db.cursor(row_factory=dict_row) as cur:
         row = cur.execute("""
             SELECT current_version, published, valid_until FROM source_document
@@ -530,14 +538,14 @@ def activate(db, document, version, expected, hybrid, rollback=False, *, prepare
             cur.execute("""
                 INSERT INTO managed_availability_event
                     (document_id, version_id, was_published, published, previous_valid_until, valid_until,
-                     previous_valid_from, valid_from)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (document, version, row["published"], True, row["valid_until"], valid_until, None, valid_from))
+                     previous_valid_from, valid_from, actor_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (document, version, row["published"], True, row["valid_until"], valid_until, None, valid_from, actor_id))
         if current != str(version):
             cur.execute("""
-                INSERT INTO managed_publish_event (document_id, previous_version, version_id, action)
-                VALUES (%s, %s, %s, %s)
-            """, (document, current, version, "rollback" if rollback else "publish"))
+                INSERT INTO managed_publish_event (document_id, previous_version, version_id, action, actor_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (document, current, version, "rollback" if rollback else "publish", actor_id))
     return {"current_version": version}
 
 
@@ -707,15 +715,24 @@ PARSE_STATES = {"queued": "queued", "parsing": "running", "ready": "done", "fail
 PUBLISH_STATES = {"queued": "queued", "indexing": "running", "published": "done", "failed": "failed"}
 
 
-def task_feed(db, library=None, days=30):
+def task_feed(db, library=None, days=30, *, member=None):
     scope, parameters = "", []
     if library:
         scope, parameters = " AND f.library=%s", [library]
+    if member:
+        scope += " AND %s IN (COALESCE(f.requested_by,kb.owner_member_id), f.publication_actor_id)"
+        parameters.append(member)
     with db.cursor(row_factory=dict_row) as cur:
         files = cur.execute("""
             SELECT f.id, f.document_id, f.library, kb.name AS library_name, f.title, f.filename,
                    f.status, f.attempts, f.next_check, f.last_error, f.created_at,
-                   f.publication_status, f.publication_error, f.publication_requested_at,
+                   f.publication_status, f.publication_error, f.publication_requested_at, f.auto_publish,
+                   kb.owner_member_id IS NOT NULL AS personal,
+                   COALESCE(f.requested_by,kb.owner_member_id) AS member_id,
+                   COALESCE(m.display_name,a.display_name,a.username,f.requested_by,kb.owner_member_id) AS member_name,
+                   COALESCE(f.publication_actor_id,f.requested_by,kb.owner_member_id) AS publisher_id,
+                   COALESCE(pa.display_name,pa.username,pm.display_name,m.display_name,a.display_name,a.username,
+                            f.publication_actor_id,f.requested_by,kb.owner_member_id) AS publisher_name,
                    -- next_check is the "look at me again" clock, and a live worker claims a
                    -- free queued job immediately, so a queue that nobody touched for five
                    -- minutes means the parser is down. The NOT EXISTS guard keeps a busy
@@ -728,23 +745,34 @@ def task_feed(db, library=None, days=30):
                    GREATEST(0, EXTRACT(EPOCH FROM (statement_timestamp() - f.created_at))::int)
                      AS waiting_seconds
             FROM managed_file f JOIN knowledge_base kb ON kb.id = f.library
-            WHERE kb.owner_member_id IS NULL AND f.created_at > statement_timestamp() - make_interval(days => %s)""" + scope + """
+            LEFT JOIN member_account m ON m.id=COALESCE(f.requested_by,kb.owner_member_id)
+            LEFT JOIN admin_account a ON a.id=f.requested_by
+            LEFT JOIN admin_account pa ON pa.id=f.publication_actor_id
+            LEFT JOIN member_account pm ON pm.id=f.publication_actor_id
+            WHERE f.created_at > statement_timestamp() - make_interval(days => %s)""" + scope + """
             ORDER BY COALESCE(f.publication_requested_at, f.created_at) DESC LIMIT 200
         """, [days, *parameters]).fetchall()
         source_scope, source_parameters = "", []
         if library:
             source_scope, source_parameters = " AND s.library=%s", [library]
+        if member:
+            source_scope += " AND COALESCE(s.requested_by,kb.owner_member_id)=%s"
+            source_parameters.append(member)
         sources = cur.execute("""
             SELECT s.id, s.document_id, s.library, kb.name AS library_name, s.title, s.provider,
-                   s.checked_at, s.last_error
+                   s.checked_at, s.last_error, s.user_imported, kb.owner_member_id IS NOT NULL AS personal,
+                   COALESCE(s.requested_by,kb.owner_member_id) AS member_id,
+                   COALESCE(m.display_name,a.display_name,a.username,s.requested_by,kb.owner_member_id) AS member_name
             FROM managed_source s JOIN knowledge_base kb ON kb.id = s.library
-            WHERE kb.owner_member_id IS NULL AND s.checked_at > statement_timestamp() - make_interval(days => %s)""" + source_scope + """
+            LEFT JOIN member_account m ON m.id=COALESCE(s.requested_by,kb.owner_member_id)
+            LEFT JOIN admin_account a ON a.id=s.requested_by
+            WHERE s.checked_at > statement_timestamp() - make_interval(days => %s)""" + source_scope + """
             ORDER BY s.checked_at DESC LIMIT 100
         """, [days, *source_parameters]).fetchall()
 
     items = []
     for row in files:
-        if row["publication_status"]:
+        if row["publication_status"] and (not member or row["publisher_id"] == member):
             items.append({
                 "id": "publish:" + str(row["id"]), "kind": "publish", "job_id": str(row["id"]),
                 "version_id": str(row["id"]), "document_id": row["document_id"],
@@ -752,7 +780,10 @@ def task_feed(db, library=None, days=30):
                 "title": row["title"], "filename": row["filename"],
                 "status": PUBLISH_STATES.get(row["publication_status"], "queued"),
                 "error": row["publication_error"], "at": row["publication_requested_at"],
+                "member_id": row["publisher_id"], "member_name": row["publisher_name"], "personal": row["personal"],
             })
+        if member and row["member_id"] != member:
+            continue
         items.append({
             "id": "parse:" + str(row["id"]), "kind": "parse", "job_id": str(row["id"]),
             "version_id": str(row["id"]), "document_id": row["document_id"],
@@ -761,6 +792,8 @@ def task_feed(db, library=None, days=30):
             "status": PARSE_STATES.get(row["status"], "queued"),
             "error": row["last_error"], "at": row["created_at"],
             "stalled": bool(row["stalled"]), "waiting_seconds": row["waiting_seconds"],
+            "member_id": row["member_id"], "member_name": row["member_name"], "personal": row["personal"],
+            "auto_publish": row["auto_publish"] or row["personal"],
         })
     for row in sources:
         items.append({
@@ -769,13 +802,19 @@ def task_feed(db, library=None, days=30):
             "library_name": row["library_name"], "title": row["title"],
             "filename": row["provider"], "status": "failed" if row["last_error"] else "done",
             "error": row["last_error"], "at": row["checked_at"],
+            "member_id": row["member_id"], "member_name": row["member_name"], "personal": row["personal"],
+            "user_imported": row["user_imported"],
         })
+    for item in items:
+        if item["personal"]:
+            item.update(title="个人知识库", filename=None, document_id=None, version_id=None, job_id=None,
+                        source_id=None, library=None, error="处理失败" if item["error"] else None)
     items.sort(key=lambda item: item["at"] or "", reverse=True)
     return items
 
 
 AUDIT_KINDS = {"publish": "发布", "rollback": "回滚", "unpublish": "下架", "restore": "恢复上线",
-               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问", "delete": "删除文档", **MEMBER_EVENTS}
+               "schedule": "调整有效期", "grant": "授权", "revoke": "撤销访问", "delete": "删除文档", "upload": "上传文档", **MEMBER_EVENTS}
 
 
 def retrieval_feed(db, *, days, member, library, status, before, limit):
@@ -803,33 +842,47 @@ def retrieval_feed(db, *, days, member, library, status, before, limit):
     return {"items": rows[:limit], "next_before": rows[limit - 1]["id"] if len(rows) > limit else None}
 
 
-def audit_feed(db, library=None, kind=None, limit=200):
-    scope, parameters = "", []
-    if library:
-        scope, parameters = " WHERE library = %s", [library]
+def audit_feed(db, library=None, kind=None, limit=200, *, member=None):
+    values = [("feed.library", library), ("feed.action", kind), ("feed.member", member)]
+    conditions = [column + "=%s" for column, value in values if value]
+    parameters = [value for _, value in values if value]
+    scope = " WHERE " + " AND ".join(conditions) if conditions else ""
     with db.cursor(row_factory=dict_row) as cur:
         rows = cur.execute("""
-            SELECT * FROM (
-                SELECT 'publish' AS source, e.created_at AS at, e.action AS action,
-                       d.kb_id AS library, kb.name AS library_name, mv.title AS object_title,
-                       e.version_id::text AS version_id, e.document_id, NULL::text AS member
+            SELECT feed.*, COALESCE(m.display_name,a.display_name,a.username,feed.member) AS member_name FROM (
+                SELECT 'upload' AS source, i.created_at AS at, 'upload' AS action,
+                       i.library, k.name AS library_name,
+                       COALESCE(i.title, CASE WHEN i.kind='feishu' THEN '飞书链接' ELSE '上传文件' END) AS object_title,
+                       NULL::text AS version_id, NULL::text AS document_id, i.actor_id AS member
+                FROM knowledge_ingest_event i JOIN knowledge_base k ON k.id=i.library
+                UNION ALL
+                SELECT 'publish', e.created_at, e.action, d.kb_id, kb.name,
+                       CASE WHEN kb.owner_member_id IS NULL THEN mv.title ELSE '个人文档' END,
+                       CASE WHEN kb.owner_member_id IS NULL THEN e.version_id::text END,
+                       CASE WHEN kb.owner_member_id IS NULL THEN e.document_id END,
+                       COALESCE(e.actor_id,kb.owner_member_id, f.requested_by)
                 FROM managed_publish_event e
                 JOIN managed_version mv ON mv.id = e.version_id
                 JOIN source_document d ON d.platform='upload' AND d.document_id = e.document_id
-                JOIN knowledge_base kb ON kb.id = d.kb_id AND kb.owner_member_id IS NULL
+                JOIN knowledge_base kb ON kb.id=d.kb_id
+                LEFT JOIN managed_file f ON f.id=e.version_id
                 UNION ALL
                 SELECT 'availability',
                        a.created_at,
                        CASE WHEN a.was_published IS DISTINCT FROM a.published
                             THEN CASE WHEN a.published THEN 'restore' ELSE 'unpublish' END
                             ELSE 'schedule' END,
-                       d.kb_id, kb.name, mv.title, a.version_id::text, a.document_id, NULL
+                       d.kb_id, kb.name,
+                       CASE WHEN kb.owner_member_id IS NULL THEN mv.title ELSE '个人文档' END,
+                       CASE WHEN kb.owner_member_id IS NULL THEN a.version_id::text END,
+                       CASE WHEN kb.owner_member_id IS NULL THEN a.document_id END,
+                       COALESCE(a.actor_id,kb.owner_member_id)
                 FROM managed_availability_event a
                 JOIN managed_version mv ON mv.id = a.version_id
                 JOIN source_document d ON d.platform='upload' AND d.document_id = a.document_id
-                JOIN knowledge_base kb ON kb.id = d.kb_id AND kb.owner_member_id IS NULL
+                JOIN knowledge_base kb ON kb.id=d.kb_id
                 UNION ALL
-                SELECT 'deletion', e.created_at, 'delete', e.library, kb.name, e.title, NULL, e.document_id, NULL
+                SELECT 'deletion', e.created_at, 'delete', e.library, kb.name, e.title, NULL, e.document_id, e.actor_id
                 FROM managed_delete_event e
                 JOIN knowledge_base kb ON kb.id=e.library AND kb.owner_member_id IS NULL
                 UNION ALL
@@ -845,13 +898,13 @@ def audit_feed(db, library=None, kind=None, limit=200):
                        COALESCE(m.display_name, e.member), NULL::text, NULL::text, e.member
                 FROM member_event e
                 LEFT JOIN member_account m ON m.id = e.member
-            ) feed""" + scope + """
+            ) feed
+            LEFT JOIN member_account m ON m.id=feed.member
+            LEFT JOIN admin_account a ON a.id=feed.member""" + scope + """
             ORDER BY at DESC LIMIT %s
         """, [*parameters, limit]).fetchall()
     for row in rows:
         row["action_label"] = AUDIT_KINDS.get(row["action"], row["action"])
-    if kind:
-        rows = [row for row in rows if row["action"] == kind]
     return rows
 
 

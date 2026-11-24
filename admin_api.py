@@ -19,11 +19,11 @@ from admin import (ManagementError, WebLoginError, access_contact_url, activate,
                    close_session, create_admin, create_member, delete_document, documents, issue_member_web_setup, libraries,
                    member_directory, migrate, open_member_web_session, open_session, preview,
                    probe, reset_member_token, resolve_session, retrieval_feed, set_admin_password, set_admin_state,
-                   set_access_contact_url, set_availability, set_member_grants, set_member_state, set_owner, task_feed, upload,
+                   set_access_contact_url, set_availability, set_member_grants, set_member_state, set_owner, task_feed,
                    versions)
 from feishu_source import bind_feishu, fetch_feishu_section
 from docling_parser import MAX_FILE, ParseError
-from file_ingest import QUEUED_SUFFIXES, jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
+from file_ingest import SUPPORTED_SUFFIXES, jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
 from notion_source import SourceError, bind_notion, list_sources, sync_source
 
 
@@ -448,16 +448,18 @@ def router(hybrid):
             raise HTTPException(422, str(error)) from None
 
     @control.get("/tasks")
-    def tasks(library: str | None = None, days: int = 30):
+    def tasks(library: str | None = None, days: int = 30,
+              member: Annotated[str | None, Query(min_length=1, max_length=160)] = None):
         with connect() as db:
             migrate(db)
-            return task_feed(db, library, max(1, min(days, 365)))
+            return task_feed(db, library, max(1, min(days, 365)), member=member)
 
     @control.get("/audit")
-    def audit(library: str | None = None, kind: str | None = None, limit: int = 200):
+    def audit(library: str | None = None, kind: str | None = None, limit: int = 200,
+              member: Annotated[str | None, Query(min_length=1, max_length=160)] = None):
         with connect() as db:
             migrate(db)
-            return audit_feed(db, library, kind, max(1, min(limit, 500)))
+            return audit_feed(db, library, kind, max(1, min(limit, 500)), member=member)
 
     @control.get("/retrieval-records")
     def retrieval_records(
@@ -536,42 +538,30 @@ def router(hybrid):
             raise HTTPException(error.status, str(error)) from None
 
     @control.post("/sources/{identifier}/sync")
-    def sync_online_source(identifier: UUID):
+    def sync_online_source(identifier: UUID, identity: Annotated[dict, Depends(admin_identity)]):
         try:
             with connect() as db:
+                db.execute("UPDATE managed_source SET requested_by=%s WHERE id=%s AND NOT user_imported",
+                           (identity["id"], identifier))
                 return sync_source(db, identifier, fetch_feishu_section)
         except SourceError as error:
             raise HTTPException(error.status, str(error)) from None
 
     @control.post("/libraries/{library}/documents", status_code=201)
     def add_version(library: str, title: Annotated[Title, Form()], file: Annotated[UploadFile, File()],
+                    identity: Annotated[dict, Depends(admin_identity)],
                     document_id: Annotated[UUID | None, Form()] = None):
         filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
-        suffix = Path(filename).suffix.lower()
-        if len(filename) <= 200 and suffix in QUEUED_SUFFIXES:
-            data = file.file.read(MAX_FILE + 1)
-            if len(data) > MAX_FILE:
-                raise HTTPException(413, "上传文件超过 20 MiB。")
-            try:
-                with connect() as db:
-                    return {"job": queue_file(db, library, document_id, title, filename, data)}
-            except (ManagementError, ParseError) as error:
-                raise HTTPException(422, str(error)) from None
-        if len(filename) > 200 or suffix not in (".md", ".txt"):
+        if len(filename) > 200 or Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
             raise HTTPException(422, "请选择 PDF、DOCX、XLSX、CSV、PPTX、扫描图片、Markdown 或 TXT。")
-        limit = 256 * 1024
+        data = file.file.read(MAX_FILE + 1)
+        if len(data) > MAX_FILE:
+            raise HTTPException(413, "上传文件超过 20 MiB。")
         try:
-            data = file.file.read(limit + 1)
-            if len(data) > limit:
-                raise HTTPException(413, "文件超过 256 KiB。")
-            original = data.decode("utf-8-sig")
-            if "\x00" in original:
-                raise ValueError("Invalid text")
             with connect() as db:
-                return upload(db, library, str(document_id) if document_id else None, title, filename, original)
-        except UnicodeDecodeError:
-            raise HTTPException(422, "请将文件另存为 UTF-8。") from None
-        except ValueError as error:
+                return {"job": queue_file(db, library, document_id, title, filename, data,
+                                          requested_by=identity["id"], auto_publish=True)}
+        except (ManagementError, ParseError) as error:
             raise HTTPException(422, str(error)) from None
 
     @control.get("/libraries/{library}/file-jobs")
@@ -596,10 +586,10 @@ def router(hybrid):
         return file_response(row)
 
     @control.delete("/documents/{document}")
-    def remove_document(document: UUID):
+    def remove_document(document: UUID, identity: Annotated[dict, Depends(admin_identity)]):
         try:
             with connect() as db:
-                if not delete_document(db, str(document)):
+                if not delete_document(db, str(document), actor_id=identity["id"]):
                     raise HTTPException(404, "找不到此文档。")
         except ManagementError as error:
             raise HTTPException(409, str(error)) from None
@@ -611,13 +601,13 @@ def router(hybrid):
             return versions(db, str(document), hybrid)
 
     @control.put("/documents/{document}/availability")
-    def visibility(document: UUID, payload: AvailabilityRequest):
+    def visibility(document: UUID, payload: AvailabilityRequest, identity: Annotated[dict, Depends(admin_identity)]):
         times = (payload.expected_valid_until, payload.valid_until, payload.valid_from)
         if any(value is not None and value.utcoffset() is None for value in times):
             raise HTTPException(422, "生效和到期时间需要包含时区。")
         try:
             with connect() as db:
-                return set_availability(db, str(document), **payload.model_dump())
+                return set_availability(db, str(document), actor_id=identity["id"], **payload.model_dump())
         except ManagementError as error:
             raise HTTPException(409, str(error)) from None
 
@@ -630,7 +620,8 @@ def router(hybrid):
             raise HTTPException(404, str(error)) from None
 
     @control.post("/documents/{document}/versions/{version}/{action}")
-    def switch(document: UUID, version: UUID, action: str, payload: ChangeVersion, response: Response):
+    def switch(document: UUID, version: UUID, action: str, payload: ChangeVersion, response: Response,
+               identity: Annotated[dict, Depends(admin_identity)]):
         if action not in ("publish", "rollback"):
             raise HTTPException(404)
         times = (payload.valid_from, payload.valid_until)
@@ -642,11 +633,12 @@ def router(hybrid):
         try:
             with connect() as db:
                 if action == "publish" and (job := queue_publication(
-                        db, str(document), version, payload.expected, *(schedule or (None, None)))):
+                        db, str(document), version, payload.expected, *(schedule or (None, None)),
+                        actor_id=identity["id"])):
                     response.status_code = 202
                     return job
                 return activate(db, str(document), version, payload.expected, hybrid,
-                                rollback=action == "rollback", schedule=schedule)
+                                rollback=action == "rollback", schedule=schedule, actor_id=identity["id"])
         except ManagementError as error:
             raise HTTPException(409, str(error)) from None
 

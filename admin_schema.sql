@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS managed_file (
 );
 CREATE INDEX IF NOT EXISTS managed_file_work ON managed_file(next_check)
     WHERE status IN ('queued','parsing');
+ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS requested_by text;
+ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS auto_publish boolean NOT NULL DEFAULT false;
+ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS requires_mcp_grant boolean NOT NULL DEFAULT false;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS requested_by text;
+ALTER TABLE managed_publish_event ADD COLUMN IF NOT EXISTS actor_id text;
+ALTER TABLE managed_availability_event ADD COLUMN IF NOT EXISTS actor_id text;
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_status text
     CHECK (publication_status IN ('queued','indexing','published','failed'));
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_expected text;
@@ -82,6 +88,7 @@ ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_previous_live bool
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_previous_until timestamptz;
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_requested_at timestamptz;
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_error text;
+ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_actor_id text;
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_valid_from timestamptz;
 ALTER TABLE managed_file ADD COLUMN IF NOT EXISTS publication_valid_until timestamptz;
 CREATE UNIQUE INDEX IF NOT EXISTS managed_file_one_publication ON managed_file(document_id)
@@ -183,6 +190,28 @@ CREATE TABLE IF NOT EXISTS managed_delete_event (
     title text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE managed_delete_event ADD COLUMN IF NOT EXISTS actor_id text;
+CREATE TABLE IF NOT EXISTS knowledge_ingest_event (
+    kind text NOT NULL CHECK (kind IN ('file','feishu')),
+    origin_id uuid NOT NULL,
+    library text NOT NULL REFERENCES knowledge_base(id),
+    actor_id text NOT NULL,
+    title text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, origin_id)
+);
+CREATE INDEX IF NOT EXISTS knowledge_ingest_event_actor_recent ON knowledge_ingest_event(actor_id, created_at DESC);
+INSERT INTO knowledge_ingest_event (kind, origin_id, library, actor_id, created_at)
+SELECT 'file', f.id, f.library, k.owner_member_id, f.created_at
+FROM managed_file f JOIN knowledge_base k ON k.id=f.library
+WHERE k.owner_member_id IS NOT NULL
+ON CONFLICT DO NOTHING;
+INSERT INTO knowledge_ingest_event (kind, origin_id, library, actor_id, created_at)
+SELECT 'feishu', v.id, s.library, k.owner_member_id, v.created_at
+FROM managed_source s JOIN knowledge_base k ON k.id=s.library
+JOIN managed_version v ON v.platform=s.document_platform AND v.document_id=s.document_id
+WHERE s.user_imported AND k.owner_member_id IS NOT NULL
+ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS feishu_user_authorization (
     role text NOT NULL CHECK (role IN ('member','admin')),
     account_id text NOT NULL,

@@ -188,7 +188,7 @@ async function onUploaded(result) {
     router.push({ name: "tasks" });
     return;
   }
-  toast("草稿已生成，请核对分块后发布。");
+  toast("处理完成后自动发布。");
   await reload();
   if (result.document_id === docId.value) {
     await selectVersion(versions.value[0].id);

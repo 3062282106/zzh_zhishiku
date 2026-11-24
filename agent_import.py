@@ -16,7 +16,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 from access import ADMIN_MCP_PREFIX, is_admin_mcp_token, member_web_identity, token_hash
-from admin import ManagementError, activate, normalize_member_email, resolve_session
+from admin import ManagementError, activate, normalize_member_email, record_ingest, resolve_session
 from feishu_source import call, fetch_feishu_document, parse_link
 from notion_source import SourceError, bind_source, stage_source_snapshot
 
@@ -302,11 +302,22 @@ def personal_library(db, member_id, *, create=False):
     return row[0] if row else None
 
 
+def uploadable_libraries(db, actor):
+    if actor.role == "member":
+        return [{"name": "个人知识库", "id": "个人知识库"}]
+    return [{"id": key, "name": name} for key, name in db.execute("""
+        SELECT k.id, k.name FROM admin_upload_grant g JOIN knowledge_base k ON k.id=g.library
+        WHERE g.admin_id=%s AND k.owner_member_id IS NULL ORDER BY k.name, k.id
+    """, (actor.id,))]
+
+
 def target_library(db, actor, target):
     if actor.role == "member":
         if target not in (None, "个人知识库"):
             raise SourceError("普通成员只能上传到自己的个人知识库。", 403)
         return None, "个人知识库"
+    if target is None:
+        raise SourceError("请先调用 list_upload_libraries，列出可上传的企业知识库，让用户选择目标库。", 422)
     choices = db.execute("""
         SELECT k.id, k.name FROM admin_upload_grant g JOIN knowledge_base k ON k.id=g.library
         WHERE g.admin_id=%s AND k.owner_member_id IS NULL AND (k.id=%s OR k.name=%s)
@@ -319,10 +330,11 @@ def target_library(db, actor, target):
     raise SourceError("请明确指定一个已授予你上传权限的企业知识库。", 403)
 
 
-def publish_personal_import(db, token, actor, source_id, document, version, hybrid):
+def publish_staged_import(db, token, actor, source_id, document, version, target, hybrid):
     with db.transaction():
         if import_identity(db, token, lock=True) != actor:
             raise SourceError("上传权限已变更，请重试。", 403)
+        target_library(db, actor, target)
         row = db.execute("""
             SELECT d.current_version, d.published, s.last_version_id
             FROM managed_source s JOIN source_document d
@@ -335,9 +347,9 @@ def publish_personal_import(db, token, actor, source_id, document, version, hybr
         if current == str(version) and published:
             return "published", current, None
         if latest != version:
-            return "superseded", current, "有更新的导入版本，请查看个人知识库。"
+            return "superseded", current, "有更新的导入版本，请查看目标知识库。"
         try:
-            activate(db, document, version, current, hybrid)
+            activate(db, document, version, current, hybrid, actor_id=actor.id)
         except ManagementError as error:
             return "publication_failed", current, str(error)
     return "published", str(version), None
@@ -380,21 +392,20 @@ def stage_feishu_import(db, token, url, target=None, heading=None, *, hybrid=Fal
             source["last_digest"] = None
         try:
             result = stage_source_snapshot(db, source, markdown, line_blocks)
+            cur.execute("UPDATE managed_source SET requested_by=%s WHERE id=%s", (actor.id, source["id"]))
+            if result["changed"]:
+                record_ingest(db, "feishu", result["version_id"], library, actor.id, title)
         except ManagementError as error:
             raise SourceError(str(error), 422) from None
     document, version = result["document_id"], result["version_id"]
     review = (f"/admin/query?document={document}&version={version}" if actor.role == "member"
               else f"/admin/kb/{library}/doc/{document}?v={version}")
-    if actor.role == "member":
-        status, live, publication_error = publish_personal_import(db, token, actor, source["id"], document, version, hybrid)
-    else:
-        row = db.execute("SELECT current_version FROM source_document WHERE platform='upload' AND document_id=%s",
-                         (document,)).fetchone()
-        if row is None:
-            raise SourceError("这份文档已删除。", 404)
-        live, = row
-        status = "draft_created" if result["changed"] else "unchanged"
-        publication_error = None
+    status, live, publication_error = publish_staged_import(
+        db, token, actor, source["id"], document, version, target, hybrid,
+    )
+    if status == "publication_failed":
+        db.execute("UPDATE managed_source SET last_error=%s WHERE id=%s AND last_version_id=%s",
+                   (publication_error, source["id"], version))
     outcome = {**result, "status": status, "published_version": live or None, "title": title, "library": name,
                "review_url": origin + review, "source_url": url}
     if publication_error:

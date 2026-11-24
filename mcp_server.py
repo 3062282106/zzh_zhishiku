@@ -23,7 +23,7 @@ from pydantic import Field, StringConstraints
 
 BASE_URL = "http://127.0.0.1:18081"
 TOKEN_FILE = ROOT / ".local" / "test-accounts.json"
-MAX_ATTACHMENT_BASE64 = 4 * ((5 * 1024 * 1024 + 2) // 3)
+MAX_ATTACHMENT_BASE64 = 4 * ((20 * 1024 * 1024 + 2) // 3)
 
 
 class RejectRedirects(HTTPRedirectHandler):
@@ -88,6 +88,11 @@ def create_server(get_token):
         """通过搜索结果里的 chunk_id 重新读取证据。每次调用都检查当前权限。"""
         return tool_result(request(f"/v1/knowledge/references/{chunk_id}", get_token()))
 
+    @server.tool(annotations=read_only)
+    def list_upload_libraries() -> CallToolResult:
+        """列出当前调用身份有权上传的知识库及其 ID。管理员没明确目标库或有同名库时，列出选项让用户选择，再调用上传。"""
+        return tool_result(request("/v1/knowledge/imports/libraries", get_token()))
+
     @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                              idempotent_hint=True, open_world_hint=True))
     def import_feishu_document(
@@ -95,11 +100,12 @@ def create_server(get_token):
         library: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
         section_heading: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
     ) -> CallToolResult:
-        """仅在用户明确要求入库时使用。个人知识库导入后自动发布，企业知识库导入为草稿。
-        普通成员留空 library 或填写「个人知识库」。有授权的管理员必须明确指定企业库名称或 ID。
+        """仅在用户明确要求入库时使用。导入后自动发布。
+        普通成员留空 library 或填写「个人知识库」。管理员必须使用用户明确指定的企业库名称或 ID。
+        用户没有指定目标或目标有歧义时，调用 list_upload_libraries 并让用户选定。
         未提供章节时读取整篇。authorization_required 时请把网页授权链接交给用户，授权后重试。
         processing 时用 get_feishu_import_status 和返回的 job_id 查询进度。
-        published 表示已可检索。publication_failed 表示个人文档已导入但索引未完成，可重新导入重试。"""
+        published 表示已可检索。publication_failed 表示文档已导入但索引未完成，可重新导入重试。"""
         return tool_result(request("/v1/knowledge/imports/feishu", get_token(), {
             "url": url, "library": library, "section_heading": section_heading,
         }))
@@ -119,9 +125,10 @@ def create_server(get_token):
         library: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
         title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
     ) -> CallToolResult:
-        """根据用户明确请求上传实际附件。支持 PDF、DOCX、XLSX、CSV、PPTX、图片、Markdown 和 TXT，最大 5 MiB。
-        content_base64 必须由客户端读取附件原始字节并编码。个人库默认，企业库须指定已获授权的名称或 ID。
-        返回任务字段 id，用 get_knowledge_file_status 查询。个人库解析后自动发布，企业库生成草稿。"""
+        """根据用户明确请求上传实际附件。支持 PDF、DOCX、XLSX、CSV、PPTX、图片、Markdown 和 TXT，最大 20 MiB。
+        content_base64 必须由客户端读取附件原始字节并编码。普通成员可用个人库默认值。
+        管理员必须使用用户明确指定的企业库名称或 ID。目标不明确时调用 list_upload_libraries 请用户选定。
+        返回任务字段 id，用 get_knowledge_file_status 查询。解析和索引完成后自动发布。"""
         return tool_result(request("/v1/knowledge/imports/files", get_token(), {
             "filename": filename, "content_base64": content_base64, "library": library, "title": title,
         }))
@@ -130,8 +137,8 @@ def create_server(get_token):
     def get_knowledge_file_status(
         job_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9-]{36}$")],
     ) -> CallToolResult:
-        """检查本次附件上传的解析与发布状态。个人库 publication_status 为 published 后可以检索。
-        企业库 status 为 ready 时草稿已生成。"""
+        """检查附件的解析与发布状态。publication_status 为 published 后可以检索。
+        status 为 ready 表示解析完成，索引可能仍在排队。"""
         return tool_result(request(f"/v1/knowledge/imports/files/{job_id}", get_token()))
 
     return server

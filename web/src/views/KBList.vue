@@ -101,7 +101,7 @@ async function onUploaded(result) {
     router.push({ name: "tasks" });
     return;
   }
-  toast("草稿已生成，请核对分块后发布。");
+  toast("处理完成后自动发布。");
   try {
     await Promise.all([loadDocs(libraryId.value), loadTasks()]);
   } catch (error) {

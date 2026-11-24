@@ -4,6 +4,7 @@ import { api } from "../api";
 import Drawer from "../components/Drawer.vue";
 import EmptyState from "../components/EmptyState.vue";
 import PageHead from "../components/PageHead.vue";
+import MemberFilter from "../components/MemberFilter.vue";
 import StatusPill from "../components/StatusPill.vue";
 import { fmtTime } from "../format";
 import { store } from "../store";
@@ -69,10 +70,7 @@ onUnmounted(() => request?.abort());
           <option :value="7">最近 7 天</option>
           <option :value="30">最近 30 天</option>
         </select>
-        <select v-model="filters.member" aria-label="成员" @change="load()">
-          <option value="">全部成员</option>
-          <option v-for="member in store.members" :key="member.id" :value="member.id">{{ member.name }}</option>
-        </select>
+        <MemberFilter v-model="filters.member" @update:model-value="load()" />
         <select v-model="filters.library" aria-label="知识库" @change="load()">
           <option value="">全部知识库</option>
           <option v-for="library in store.libraries" :key="library.id" :value="library.id">{{ library.name }}</option>
