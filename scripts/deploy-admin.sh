@@ -107,6 +107,11 @@ if ! grep -q '^KB_ADMIN_PASSWORD=' "$envfile"; then
     "$("$app/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(12))')" >> "$envfile"
   echo '已生成初始管理员 admin，密码在 /etc/knowledge-kb/api.env 的 KB_ADMIN_PASSWORD。'
 fi
+if ! grep -q '^KB_FEISHU_TOKEN_KEY=' "$envfile"; then
+  chmod 0600 "$envfile"
+  feishu_token_key=$("$app/.venv/bin/python" -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')
+  printf '\nKB_FEISHU_TOKEN_KEY=%s\n' "$feishu_token_key" >> "$envfile"
+fi
 systemctl restart knowledge-kb-api.service knowledge-kb-mcp.service
 curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18081/healthz
 printf '\n'

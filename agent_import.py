@@ -11,6 +11,7 @@ from time import monotonic
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
+from cryptography.fernet import Fernet, InvalidToken
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
@@ -69,7 +70,6 @@ class ExpiringCache:
 
 
 oauth_requests = ExpiringCache()
-feishu_tokens = ExpiringCache()
 
 
 def web_importer(db, token):
@@ -200,6 +200,7 @@ def begin_oauth(db, token, state):
     if not actor.email:
         raise SourceError("请先在知识库后台绑定你的企业邮箱。", 409)
     app, _, redirect = oauth_settings()
+    token_cipher()
     verifier = token_urlsafe(48)
     challenge = urlsafe_b64encode(sha256(verifier.encode()).digest()).decode().rstrip("=")
     oauth_requests.put(state, OAuthRequest(actor, token, verifier, redirect), 300)
@@ -254,12 +255,41 @@ def complete_oauth(db, pending, code):
         raise OAuthFailure("mismatch")
     if web_importer(db, pending.web_token) != pending.actor or not upload_enabled(db, pending.actor):
         raise OAuthFailure("session")
-    feishu_tokens.put(pending.actor.key, (email, access_token), min(7200, expires_in - 30))
+    save_user_token(db, pending.actor, app, access_token, min(7200, expires_in - 30))
 
 
-def user_token(actor):
-    authorized = feishu_tokens.get(actor.key)
-    return authorized[1] if authorized and authorized[0] == actor.email else None
+def token_cipher():
+    key = os.environ.get("KB_FEISHU_TOKEN_KEY", "").strip()
+    try:
+        return Fernet(key.encode("ascii"))
+    except ValueError:
+        raise SourceError("飞书授权的加密存储尚未配置，请联系管理员。", 503) from None
+
+
+def save_user_token(db, actor, app_id, access_token, lifetime):
+    encrypted = token_cipher().encrypt(access_token.encode())
+    with db.transaction():
+        db.execute("DELETE FROM feishu_user_authorization WHERE expires_at <= statement_timestamp()")
+        db.execute("""
+            INSERT INTO feishu_user_authorization (role, account_id, email, app_id, ciphertext, expires_at)
+            VALUES (%s,%s,%s,%s,%s,statement_timestamp() + make_interval(secs => %s))
+            ON CONFLICT (role, account_id) DO UPDATE SET email=EXCLUDED.email, app_id=EXCLUDED.app_id,
+                ciphertext=EXCLUDED.ciphertext, expires_at=EXCLUDED.expires_at
+        """, (*actor.key, actor.email, app_id, encrypted, lifetime))
+
+
+def user_token(db, actor):
+    row = db.execute("""
+        SELECT ciphertext FROM feishu_user_authorization
+        WHERE role=%s AND account_id=%s AND email=%s AND app_id=%s AND expires_at > statement_timestamp()
+    """, (*actor.key, actor.email, os.environ.get("KB_FEISHU_APP_ID", "").strip())).fetchone()
+    if row is None:
+        return None
+    try:
+        return token_cipher().decrypt(bytes(row[0])).decode()
+    except (InvalidToken, UnicodeError):
+        logging.getLogger(__name__).warning("Stored Feishu authorization could not be decoded")
+        return None
 
 
 def personal_library(db, member_id, *, create=False):
@@ -316,14 +346,14 @@ def stage_feishu_import(db, token, url, target=None, heading=None, *, hybrid=Fal
     kind, external, url = parse_link(url)
     _, _, redirect = oauth_settings()
     origin = console_origin(redirect)
-    access = user_token(actor)
+    access = user_token(db, actor)
     if not access:
         destination = console_path(actor) + ("?personal=1" if actor.role == "member" else "?authorize=feishu")
         return {"status": "authorization_required", "authorization_url": origin + destination,
                 "message": "请登录知识库网页并点击「授权飞书」，使用与知识库账号相同的企业邮箱，然后重试。"}
     doc_id, title, markdown, line_blocks = fetch_feishu_document(url, heading, access)
     with db.transaction(), db.cursor(row_factory=dict_row) as cur:
-        if import_identity(db, token, lock=True) != actor or user_token(actor) != access:
+        if import_identity(db, token, lock=True) != actor or user_token(db, actor) != access:
             raise SourceError("上传权限或飞书授权已变更，请重试。", 403)
         library, name = target_library(db, actor, target)
         if actor.role == "member":

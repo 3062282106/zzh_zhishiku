@@ -152,7 +152,7 @@ def router(hybrid):
         try:
             with connect() as db:
                 actor = web_importer(db, token)
-                return {"authorized": bool(user_token(actor)), "upload_enabled": upload_enabled(db, actor),
+                return {"authorized": bool(user_token(db, actor)), "upload_enabled": upload_enabled(db, actor),
                         "email": actor.email}
         except SourceError as error:
             raise translate(error) from None

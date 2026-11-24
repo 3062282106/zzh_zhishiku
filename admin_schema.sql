@@ -172,6 +172,16 @@ CREATE TABLE IF NOT EXISTS member_web_credential (
     CHECK ((password_hash IS NOT NULL AND setup_hash IS NULL AND setup_expires_at IS NULL)
         OR (password_hash IS NULL AND setup_hash IS NOT NULL AND setup_expires_at IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS feishu_user_authorization (
+    role text NOT NULL CHECK (role IN ('member','admin')),
+    account_id text NOT NULL,
+    email text NOT NULL,
+    app_id text NOT NULL,
+    ciphertext bytea NOT NULL,
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (role, account_id)
+);
+CREATE INDEX IF NOT EXISTS feishu_user_authorization_expiry ON feishu_user_authorization(expires_at);
 CREATE TABLE IF NOT EXISTS console_setting (
     key text PRIMARY KEY,
     value text NOT NULL
