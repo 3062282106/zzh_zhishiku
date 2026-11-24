@@ -233,10 +233,12 @@ def complete_oauth(db, pending, code):
     app, secret, redirect = oauth_settings()
     if redirect != pending.redirect:
         raise SourceError("飞书授权配置已变更，请重试。", 409)
-    data = oauth_call("token", "/oauth/v3/token", body={
+    # Feishu v3 returned 20049 for the documented S256 flow in production.
+    # v2 supports this authorization endpoint's PKCE exchange.
+    data = oauth_call("token", "/authen/v2/oauth/token", body={
         "grant_type": "authorization_code", "client_id": app, "client_secret": secret,
         "code": code, "redirect_uri": redirect, "code_verifier": pending.verifier,
-    }, origin=ACCOUNTS)
+    })
     access_token, expires_in = data.get("access_token"), data.get("expires_in")
     if not isinstance(access_token, str) or not access_token or type(expires_in) is not int or expires_in <= 30:
         logging.getLogger(__name__).warning("Feishu OAuth token response lacks a usable token or expiry")
