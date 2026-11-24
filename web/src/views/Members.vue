@@ -174,7 +174,7 @@ async function adminImportAction(action) {
       });
       await loadAdminImport(managedAdmin.value);
       await loadAdministrators();
-      toast("已保存飞书导入权限。");
+      toast("已保存 MCP 知识库权限。");
     } else if (action === "authorize") {
       const authorization = await knowledgeApi("/feishu/authorize", { method: "POST" });
       window.location.assign(authorization.url);
@@ -503,7 +503,7 @@ async function copy(text, label) {
         <input id="admin-import-email" v-model.trim="adminImport.email" type="email" maxlength="200">
       </div>
       <div class="field">
-        <label>可通过 Agent 导入的企业知识库</label>
+        <label>MCP 可检索和导入的企业知识库</label>
         <div class="checks">
           <label v-for="lib in store.libraries" :key="lib.id">
             <input v-model="adminImport.libraries" type="checkbox" :value="lib.id">{{ lib.name }}
@@ -511,22 +511,22 @@ async function copy(text, label) {
         </div>
       </div>
       <div class="rowacts" style="justify-content:flex-start">
-        <button class="btn sm primary" :disabled="busy" @click="adminImportAction('save')">保存导入权限</button>
+        <button class="btn sm primary" :disabled="busy" @click="adminImportAction('save')">保存 MCP 权限</button>
         <button v-if="ownAdmin && adminImport.libraries.length" class="btn sm" :disabled="busy" @click="adminImportAction('authorize')">
           {{ feishuAuthorized ? '重新授权飞书' : '授权飞书' }}
         </button>
         <button v-if="ownAdmin && adminImport.libraries.length" class="btn sm" :disabled="busy" @click="confirmBox({
-          title: adminImport.has_token ? '更换专用导入令牌？' : '生成专用导入令牌？',
-          note: adminImport.has_token ? '原导入令牌立即失效。' : '该令牌允许 Agent 向你获授权的企业库提交飞书草稿。',
+          title: adminImport.has_token ? '重置 MCP 令牌？' : '生成 MCP 令牌？',
+          note: adminImport.has_token ? '原令牌立即失效，请更新现有连接器。' : '用此令牌连接 MCP 后，可检索和导入勾选的企业知识库。',
           label: '生成', action: () => adminImportAction('token'),
-        })">{{ adminImport.has_token ? '更换导入令牌' : '生成导入令牌' }}</button>
+        })">{{ adminImport.has_token ? '重置 MCP 令牌' : '生成 MCP 令牌' }}</button>
       </div>
       <div v-if="adminImportToken" class="field">
-        <label>专用导入令牌</label>
+        <label>MCP 令牌</label>
         <div class="secret">
           <code>{{ adminImportToken }}</code>
-          <button class="btn sm" @click="copy(adminImportToken, '导入令牌')">复制</button>
-          <p class="muted">在 MCP 连接器中使用此令牌，可以提交企业库导入草稿。</p>
+          <button class="btn sm" @click="copy(adminImportToken, 'MCP 令牌')">复制</button>
+          <p class="muted">用此令牌更新现有 MCP 连接器，同一个连接可检索和导入。</p>
         </div>
       </div>
     </template>

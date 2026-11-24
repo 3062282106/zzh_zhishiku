@@ -13,7 +13,8 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse,
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
 
-from access import VISIBLE, connect, is_member_web_token, member_web_identity, reader_digest, token_hash
+from access import (connect, is_member_web_token, member_web_identity, reader_digest, reader_id,
+                    reader_visibility, token_hash)
 from admin import (ManagementError, WebLoginError, access_contact_url, activate, admin_directory, audit_feed,
                    close_session, create_admin, create_member, documents, issue_member_web_setup, libraries,
                    member_directory, migrate, open_member_web_session, open_session, preview,
@@ -91,11 +92,14 @@ def reader_identity(credentials: Annotated[HTTPAuthorizationCredentials | None, 
     return credentials.credentials
 
 
-def member_file_digest(db, token):
+def knowledge_file_digest(db, token):
     try:
-        return reader_digest(db, token)
+        digest = reader_digest(db, token)
     except PermissionError:
         raise HTTPException(401, "登录已过期，请重新登录。") from None
+    if not reader_id(db, token, digest):
+        raise HTTPException(401, "无效的知识库令牌。")
+    return digest
 
 
 def enterprise_scope(request: Request):
@@ -639,15 +643,13 @@ def router(hybrid):
     @routes.get("/v1/knowledge/originals/{document}/{version}")
     def original(document: UUID, version: UUID, token: Annotated[str, Depends(reader_identity)]):
         with connect() as db:
-            digest = member_file_digest(db, token)
-            if not db.execute("SELECT 1 FROM member_account WHERE token_hash=%s AND enabled", (digest,)).fetchone():
-                raise HTTPException(401, "无效的知识库令牌。")
+            digest = knowledge_file_digest(db, token)
             row = db.execute("""
                 SELECT v.original FROM managed_version v
                 JOIN source_chunk c ON c.platform=v.platform AND c.document_id=v.document_id AND c.version=v.id::text
                 WHERE v.platform='upload' AND v.document_id=%s AND v.id=%s
                   AND c.chunk_id IN (
-            """ + VISIBLE + ") LIMIT 1", (str(document), version, digest)).fetchone()
+            """ + reader_visibility(token) + ") LIMIT 1", (str(document), version, digest)).fetchone()
             if not row:
                 raise HTTPException(404, "找不到可访问的原文。")
         return PlainTextResponse(row[0], headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
@@ -655,16 +657,14 @@ def router(hybrid):
     @routes.get("/v1/knowledge/files/{version}")
     def original_file(version: UUID, token: Annotated[str, Depends(reader_identity)]):
         with connect() as db:
-            digest = member_file_digest(db, token)
-            if not db.execute("SELECT 1 FROM member_account WHERE token_hash=%s AND enabled", (digest,)).fetchone():
-                raise HTTPException(401, "无效的知识库令牌。")
+            digest = knowledge_file_digest(db, token)
             row = db.execute("""
                 SELECT f.content, f.filename FROM managed_file f
                 WHERE f.id=%s AND f.status='ready' AND EXISTS (
                     SELECT 1 FROM source_chunk x
                     WHERE x.platform='upload' AND x.document_id=f.document_id AND x.version=f.id::text
                       AND x.chunk_id IN (
-            """ + VISIBLE + "))", (version, digest)).fetchone()
+            """ + reader_visibility(token) + "))", (version, digest)).fetchone()
         if not row:
             raise HTTPException(404, "找不到可访问的原文件。")
         return file_response(row)

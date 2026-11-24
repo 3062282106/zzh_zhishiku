@@ -730,13 +730,15 @@ def retrieval_feed(db, *, days, member, library, status, before, limit):
         parameters.extend((library, library))
     with db.cursor(row_factory=dict_row) as cur:
         rows = cur.execute("""
-            SELECT e.id, e.recorded_at, e.member_id, COALESCE(m.display_name, e.member_id) AS member_name,
+            SELECT e.id, e.recorded_at, e.member_id,
+                   COALESCE(m.display_name, a.display_name, a.username, e.member_id) AS member_name,
                    e.status, e.channel, e.evidence_count, e.duration_ms, e.stages_ms,
                    ARRAY(SELECT COALESCE(k.name, ids.id) FROM unnest(e.searched_library_ids) AS ids(id)
                          LEFT JOIN knowledge_base k USING (id) WHERE k.owner_member_id IS NULL ORDER BY COALESCE(k.name, ids.id)) AS searched_libraries,
                    ARRAY(SELECT COALESCE(k.name, ids.id) FROM unnest(e.evidence_library_ids) AS ids(id)
                          LEFT JOIN knowledge_base k USING (id) WHERE k.owner_member_id IS NULL ORDER BY COALESCE(k.name, ids.id)) AS evidence_libraries
             FROM retrieval_event e LEFT JOIN member_account m ON m.id=e.member_id
+            LEFT JOIN admin_account a ON a.id=e.member_id
             WHERE """ + " AND ".join(conditions) + " ORDER BY e.id DESC LIMIT %s", (*parameters, limit + 1)).fetchall()
     return {"items": rows[:limit], "next_before": rows[limit - 1]["id"] if len(rows) > limit else None}
 

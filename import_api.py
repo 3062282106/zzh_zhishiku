@@ -12,7 +12,7 @@ from access import connect
 from admin import ManagementError, activate, documents, preview, versions
 from admin_api import Title, admin_identity, reader_identity
 from agent_import import (CALLBACK, admin_import_access, begin_oauth, complete_oauth,
-                          console_path, issue_admin_import_token, oauth_requests, oauth_settings,
+                          console_path, issue_admin_import_token, oauth_requests,
                           personal_library, set_admin_import_access, stage_feishu_import,
                           upload_enabled, user_token, web_importer)
 from notion_source import SourceError
@@ -196,7 +196,6 @@ def router(hybrid):
         named_admin(identity)
         response.headers["Cache-Control"] = "no-store"
         try:
-            oauth_settings()
             with connect() as db:
                 return {"token": issue_admin_import_token(db, identity["id"])}
         except SourceError as error:

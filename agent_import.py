@@ -13,7 +13,7 @@ from uuid import uuid4
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
-from access import member_web_identity, token_hash
+from access import ADMIN_MCP_PREFIX, is_admin_mcp_token, member_web_identity, token_hash
 from admin import ManagementError, normalize_member_email, resolve_session
 from feishu_source import call, fetch_feishu_document, parse_link
 from notion_source import SourceError, bind_source, stage_source_snapshot
@@ -86,18 +86,20 @@ def web_importer(db, token):
 
 def import_identity(db, token, *, lock=False):
     suffix = " FOR UPDATE OF a" if lock else ""
-    with db.cursor() as cur:
-        row = cur.execute("""
+    digest = token_hash(token)
+    if is_admin_mcp_token(token):
+        row = db.execute("""
             SELECT a.id, COALESCE(a.email, CASE WHEN position('@' in a.username) > 0 THEN a.username END, '')
             FROM admin_import_token t JOIN admin_account a ON a.id=t.admin_id
             WHERE t.token_hash=%s AND a.enabled
-        """ + suffix, (token_hash(token),)).fetchone()
-        if row:
-            return Importer("admin", row[0], row[1].strip().lower())
-        row = cur.execute("""
-            SELECT a.id, a.email, a.personal_upload FROM member_account a
-            WHERE a.token_hash=%s AND a.enabled
-        """ + suffix, (token_hash(token),)).fetchone()
+        """ + suffix, (digest,)).fetchone()
+        if not row:
+            raise SourceError("管理员 MCP 令牌无效或已停用。", 401)
+        return Importer("admin", row[0], row[1].strip().lower())
+    row = db.execute("""
+        SELECT a.id, a.email, a.personal_upload FROM member_account a
+        WHERE a.token_hash=%s AND a.enabled
+    """ + suffix, (digest,)).fetchone()
     if not row:
         raise SourceError("MCP 上传凭证无效或已停用。", 401)
     if not row[2]:
@@ -152,7 +154,7 @@ def set_admin_import_access(db, identifier, email, libraries):
 
 
 def issue_admin_import_token(db, identifier):
-    token = "imp_" + token_urlsafe(32)
+    token = ADMIN_MCP_PREFIX + token_urlsafe(32)
     with db.transaction():
         if not db.execute("SELECT 1 FROM admin_account WHERE id=%s AND enabled FOR UPDATE", (identifier,)).fetchone():
             raise SourceError("找不到已启用的管理员。", 404)

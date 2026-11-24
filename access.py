@@ -26,7 +26,12 @@ from search import DEFAULT_CHUNKS, lookup, passage, search, vector_search
 
 ACCOUNTS = PRIVATE / "test-accounts.json"
 ACCOUNTS_TO_LIBRARIES = {"operations-test": "notion", "support-test": "feishu"}
-VISIBLE_FROM = """
+PUBLISHED_AND_VALID = """
+      AND d.published
+      AND (d.valid_from IS NULL OR d.valid_from <= statement_timestamp())
+      AND (d.valid_until IS NULL OR d.valid_until > statement_timestamp())
+"""
+MEMBER_VISIBLE_FROM = """
     FROM member_account m
     JOIN knowledge_base kb ON true
     LEFT JOIN knowledge_grant g ON g.member_id = m.id AND g.kb_id = kb.id
@@ -37,11 +42,18 @@ VISIBLE_FROM = """
       AND (kb.owner_member_id = m.id OR
            (kb.owner_member_id IS NULL AND g.kb_id IS NOT NULL AND g.revoked_at IS NULL
             AND (g.expires_at IS NULL OR g.expires_at > statement_timestamp())))
-      AND d.published
-      AND (d.valid_from IS NULL OR d.valid_from <= statement_timestamp())
-      AND (d.valid_until IS NULL OR d.valid_until > statement_timestamp())
-"""
-VISIBLE = "SELECT c.chunk_id\n" + VISIBLE_FROM
+""" + PUBLISHED_AND_VALID
+ADMIN_VISIBLE_FROM = """
+    FROM admin_import_token t
+    JOIN admin_account a ON a.id = t.admin_id
+    JOIN admin_upload_grant g ON g.admin_id = a.id
+    JOIN knowledge_base kb ON kb.id = g.library AND kb.owner_member_id IS NULL
+    JOIN source_document d ON d.kb_id = kb.id
+    JOIN source_chunk c ON c.platform = d.platform
+         AND c.document_id = d.document_id AND c.version = d.current_version
+    WHERE t.token_hash = %s AND a.enabled
+""" + PUBLISHED_AND_VALID
+ADMIN_MCP_PREFIX = "imp_"
 
 
 @dataclass
@@ -107,6 +119,27 @@ def reader_digest(db, token):
     return token_hash(token)
 
 
+def is_admin_mcp_token(token):
+    # Keep already-issued administrator import tokens valid for the unified connector.
+    return len(token) == 47 and token.startswith(ADMIN_MCP_PREFIX)
+
+
+def reader_visibility(token, columns="c.chunk_id"):
+    scope = ADMIN_VISIBLE_FROM if is_admin_mcp_token(token) else MEMBER_VISIBLE_FROM
+    return "SELECT " + columns + "\n" + scope
+
+
+def reader_id(db, token, digest):
+    if is_admin_mcp_token(token):
+        row = db.execute("""
+            SELECT a.id FROM admin_import_token t JOIN admin_account a ON a.id=t.admin_id
+            WHERE t.token_hash=%s AND a.enabled
+        """, (digest,)).fetchone()
+    else:
+        row = db.execute("SELECT id FROM member_account WHERE token_hash=%s AND enabled", (digest,)).fetchone()
+    return row[0] if row else None
+
+
 def fixture_tokens():
     return json.loads(ACCOUNTS.read_text(encoding="utf-8"))
 
@@ -159,16 +192,16 @@ def authorized_ids(connection, token, subset=None, *, trace=None):
     with measure(trace, "authorization"):
         digest = reader_digest(connection, token)
         if subset is not None:
-            rows = connection.execute(VISIBLE + " AND c.chunk_id = ANY(%s)", (digest, list(subset))).fetchall()
+            rows = connection.execute(reader_visibility(token) + " AND c.chunk_id = ANY(%s)",
+                                      (digest, list(subset))).fetchall()
             return {row[0] for row in rows}
-        member = connection.execute("SELECT id FROM member_account WHERE token_hash = %s AND enabled",
-                                    (digest,)).fetchone()
+        member = reader_id(connection, token, digest)
         if member is None:
-            raise PermissionError("Invalid or disabled knowledge member")
+            raise PermissionError("Invalid or disabled knowledge account")
         if trace is None:
-            return {row[0] for row in connection.execute(VISIBLE, (digest,)).fetchall()}
-        trace.member_id = member[0]
-        trace.chunk_libraries = dict(connection.execute("SELECT c.chunk_id, d.kb_id\n" + VISIBLE_FROM,
+            return {row[0] for row in connection.execute(reader_visibility(token), (digest,)).fetchall()}
+        trace.member_id = member
+        trace.chunk_libraries = dict(connection.execute(reader_visibility(token, "c.chunk_id, d.kb_id"),
                                                         (digest,)).fetchall())
         return set(trace.chunk_libraries)
 
