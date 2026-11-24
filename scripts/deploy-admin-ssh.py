@@ -12,9 +12,9 @@ import tarfile
 
 REQUIRED = {
     "access.py", "admin.py", "admin_api.py", "admin_schema.sql", "agent_import.py", "api.py", "docling_parser.py", "feishu_source.py",
-    "file_ingest.py", "import_api.py", "mcp_server.py", "notion_source.py", "search.py", "schema.sql",
+    "feishu_sync.py", "file_ingest.py", "import_api.py", "mcp_server.py", "notion_source.py", "search.py", "schema.sql",
     "scripts/deploy-admin.sh", "scripts/verify-admin-cloud.py", "scripts/configure-notion.sh",
-    "scripts/configure-mcp-entry.sh", "scripts/configure-admin-entry.sh",
+    "scripts/configure-mcp-entry.sh", "scripts/configure-admin-entry.sh", "scripts/configure-feishu-sync.sh",
 }
 # The console is a Vite build; its hashed asset names change on every build, so the
 # archive is validated by prefix instead of by an exact file list.
@@ -53,6 +53,7 @@ def deployment_command(bundle, notion_page=None, notion_library=None, notion_tit
         f"tar -xzf {REMOTE} -C \"$release\"\n"
         f"rm -f -- {REMOTE}\n"
         'bash "$release/scripts/deploy-admin.sh"\n'
+        'bash "$release/scripts/configure-feishu-sync.sh"\n'
     )
     if notion_page:
         title = shlex.quote(notion_title)

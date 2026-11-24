@@ -87,9 +87,14 @@ def fetch_notion_markdown(page_id):
 def list_sources(db, library):
     with db.cursor(row_factory=dict_row) as cur:
         return cur.execute("""
-            SELECT id, provider, source_url, title, document_id, last_version_id, checked_at, last_error, section_heading,
-                   user_imported
-            FROM managed_source WHERE library=%s ORDER BY title, id
+            SELECT s.id, s.provider, s.source_url, s.title, s.document_id, s.last_version_id, s.checked_at,
+                   s.last_error, s.section_heading, s.user_imported,
+                   COALESCE(s.auto_sync, d.current_version <> '') AND s.provider='feishu' AS auto_sync,
+                   s.sync_requested, s.sync_next_at,
+                   COALESCE(s.sync_pending_version=s.last_version_id, false) AS indexing
+            FROM managed_source s JOIN source_document d ON d.platform=s.document_platform
+                AND d.document_id=s.document_id
+            WHERE s.library=%s ORDER BY s.title, s.id
         """, (library,)).fetchall()
 
 

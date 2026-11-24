@@ -30,6 +30,7 @@ const adminPassword = ref("");
 const adminImport = ref(null);
 const adminImportToken = ref("");
 const feishuAuthorized = ref(false);
+const feishuSyncAuthorized = ref(false);
 const ownAdmin = computed(() => managedAdmin.value?.id === auth.me?.id);
 const accounts = computed(() => [...store.members, ...administrators.value]);
 
@@ -75,6 +76,7 @@ function openMember(item) {
     adminImport.value = null;
     adminImportToken.value = "";
     feishuAuthorized.value = false;
+    feishuSyncAuthorized.value = false;
     managedAdmin.value = item;
     loadAdminImport(item).catch(fail);
     return;
@@ -160,7 +162,10 @@ async function loadAdminImport(target) {
   adminImport.value = access;
   if (ownAdmin.value && access.libraries.length) {
     const status = await knowledgeApi("/feishu/status");
-    if (managedAdmin.value?.id === target.id) feishuAuthorized.value = status.authorized;
+    if (managedAdmin.value?.id === target.id) {
+      feishuAuthorized.value = status.authorized;
+      feishuSyncAuthorized.value = status.auto_sync_authorized;
+    }
   }
 }
 
@@ -175,8 +180,9 @@ async function adminImportAction(action) {
       await loadAdminImport(managedAdmin.value);
       await loadAdministrators();
       toast("已保存 MCP 知识库权限。");
-    } else if (action === "authorize") {
-      const authorization = await knowledgeApi("/feishu/authorize", { method: "POST" });
+    } else if (action === "authorize" || action === "authorize-sync") {
+      const offline = action === "authorize-sync" || feishuSyncAuthorized.value;
+      const authorization = await knowledgeApi("/feishu/authorize" + (offline ? "?offline=true" : ""), { method: "POST" });
       window.location.assign(authorization.url);
     } else {
       const result = await api("/import-token", { method: "POST" });
@@ -515,6 +521,8 @@ async function copy(text, label) {
         <button v-if="ownAdmin && adminImport.libraries.length" class="btn sm" :disabled="busy" @click="adminImportAction('authorize')">
           {{ feishuAuthorized ? '重新授权飞书' : '授权飞书' }}
         </button>
+        <button v-if="ownAdmin && adminImport.libraries.length && !feishuSyncAuthorized" class="btn sm"
+                :disabled="busy" @click="adminImportAction('authorize-sync')">授权自动同步</button>
         <button v-if="ownAdmin && adminImport.libraries.length" class="btn sm" :disabled="busy" @click="confirmBox({
           title: adminImport.has_token ? '重置 MCP 令牌？' : '生成 MCP 令牌？',
           note: adminImport.has_token ? '原令牌立即失效，请更新现有连接器。' : '用此令牌连接 MCP 后，可检索和导入勾选的企业知识库。',

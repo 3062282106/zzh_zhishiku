@@ -43,6 +43,7 @@ class OAuthRequest:
     web_token: str
     verifier: str
     redirect: str
+    offline: bool = False
 
 
 class ExpiringCache:
@@ -193,7 +194,7 @@ def console_origin(redirect):
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def begin_oauth(db, token, state):
+def begin_oauth(db, token, state, *, offline=False):
     actor = web_importer(db, token)
     if not upload_enabled(db, actor):
         raise SourceError("你的账号尚未开通上传权限。", 403)
@@ -203,8 +204,9 @@ def begin_oauth(db, token, state):
     token_cipher()
     verifier = token_urlsafe(48)
     challenge = urlsafe_b64encode(sha256(verifier.encode()).digest()).decode().rstrip("=")
-    oauth_requests.put(state, OAuthRequest(actor, token, verifier, redirect), 300)
-    query = urlencode({"client_id": app, "response_type": "code", "redirect_uri": redirect, "scope": SCOPES, "state": state,
+    oauth_requests.put(state, OAuthRequest(actor, token, verifier, redirect, offline), 300)
+    scope = SCOPES + " offline_access" if offline else SCOPES
+    query = urlencode({"client_id": app, "response_type": "code", "redirect_uri": redirect, "scope": scope, "state": state,
                        "code_challenge": challenge, "code_challenge_method": "S256", "prompt": "consent"})
     return ACCOUNTS + "/open-apis/authen/v1/authorize?" + query
 
@@ -255,7 +257,11 @@ def complete_oauth(db, pending, code):
         raise OAuthFailure("mismatch")
     if web_importer(db, pending.web_token) != pending.actor or not upload_enabled(db, pending.actor):
         raise OAuthFailure("session")
-    save_user_token(db, pending.actor, app, access_token, min(7200, expires_in - 30))
+    refresh, refresh_lifetime = refresh_grant(data)
+    save_user_token(db, pending.actor, app, access_token, expires_in - 30,
+                    refresh_token=refresh, refresh_lifetime=refresh_lifetime)
+    if pending.offline and not refresh:
+        raise OAuthFailure("offline_missing")
 
 
 def token_cipher():
@@ -266,30 +272,85 @@ def token_cipher():
         raise SourceError("飞书授权的加密存储尚未配置，请联系管理员。", 503) from None
 
 
-def save_user_token(db, actor, app_id, access_token, lifetime):
-    encrypted = token_cipher().encrypt(access_token.encode())
+def refresh_grant(data):
+    refresh, lifetime = data.get("refresh_token"), data.get("refresh_token_expires_in")
+    return (refresh, lifetime - 30) if isinstance(refresh, str) and refresh and type(lifetime) is int and lifetime > 30 else (None, None)
+
+
+def save_user_token(db, actor, app_id, access_token, lifetime, *, refresh_token=None, refresh_lifetime=None):
+    cipher = token_cipher()
+    encrypted = cipher.encrypt(access_token.encode())
+    refresh = cipher.encrypt(refresh_token.encode()) if refresh_token else None
     with db.transaction():
-        db.execute("DELETE FROM feishu_user_authorization WHERE expires_at <= statement_timestamp()")
         db.execute("""
-            INSERT INTO feishu_user_authorization (role, account_id, email, app_id, ciphertext, expires_at)
-            VALUES (%s,%s,%s,%s,%s,statement_timestamp() + make_interval(secs => %s))
+            INSERT INTO feishu_user_authorization AS stored
+                (role, account_id, email, app_id, ciphertext, expires_at, refresh_ciphertext, refresh_expires_at)
+            VALUES (%s,%s,%s,%s,%s,statement_timestamp() + make_interval(secs => %s),
+                    %s,statement_timestamp() + make_interval(secs => %s))
             ON CONFLICT (role, account_id) DO UPDATE SET email=EXCLUDED.email, app_id=EXCLUDED.app_id,
-                ciphertext=EXCLUDED.ciphertext, expires_at=EXCLUDED.expires_at
-        """, (*actor.key, actor.email, app_id, encrypted, lifetime))
+                ciphertext=EXCLUDED.ciphertext, expires_at=EXCLUDED.expires_at,
+                refresh_ciphertext=COALESCE(EXCLUDED.refresh_ciphertext,
+                    CASE WHEN stored.email=EXCLUDED.email AND stored.app_id=EXCLUDED.app_id THEN stored.refresh_ciphertext END),
+                refresh_expires_at=COALESCE(EXCLUDED.refresh_expires_at,
+                    CASE WHEN stored.email=EXCLUDED.email AND stored.app_id=EXCLUDED.app_id THEN stored.refresh_expires_at END)
+        """, (*actor.key, actor.email, app_id, encrypted, lifetime, refresh, refresh_lifetime))
 
 
-def user_token(db, actor):
+AUTHORIZATION = """
+    FROM feishu_user_authorization WHERE role=%s AND account_id=%s AND email=%s AND app_id=%s
+"""
+
+
+def authorization_status(db, actor):
     row = db.execute("""
-        SELECT ciphertext FROM feishu_user_authorization
-        WHERE role=%s AND account_id=%s AND email=%s AND app_id=%s AND expires_at > statement_timestamp()
-    """, (*actor.key, actor.email, os.environ.get("KB_FEISHU_APP_ID", "").strip())).fetchone()
-    if row is None:
-        return None
+        SELECT expires_at > statement_timestamp(),
+               COALESCE(refresh_expires_at > statement_timestamp(), false) AND refresh_ciphertext IS NOT NULL
+    """ + AUTHORIZATION, (*actor.key, actor.email, os.environ.get("KB_FEISHU_APP_ID", "").strip())).fetchone()
+    current, renewable = row or (False, False)
+    return {"authorized": current or renewable, "auto_sync_authorized": renewable}
+
+
+def decrypt_token(ciphertext):
     try:
-        return token_cipher().decrypt(bytes(row[0])).decode()
+        return token_cipher().decrypt(bytes(ciphertext)).decode()
     except (InvalidToken, UnicodeError):
         logging.getLogger(__name__).warning("Stored Feishu authorization could not be decoded")
         return None
+
+
+def user_token(db, actor):
+    app = os.environ.get("KB_FEISHU_APP_ID", "").strip()
+    with db.transaction():
+        # A refresh token rotates on use, so API requests and background sync must share this lock.
+        row = db.execute("""
+            SELECT CASE WHEN expires_at > statement_timestamp() THEN ciphertext END,
+                   CASE WHEN refresh_expires_at > statement_timestamp() THEN refresh_ciphertext END
+        """ + AUTHORIZATION + " FOR UPDATE", (*actor.key, actor.email, app)).fetchone()
+        if not row:
+            return None
+        if row[0] is not None:
+            return decrypt_token(row[0])
+        refresh = decrypt_token(row[1]) if row[1] is not None else None
+        if not refresh:
+            return None
+        _, secret, _ = oauth_settings()
+        try:
+            data = call("/oauth/v3/token", origin=ACCOUNTS, body={
+                "grant_type": "refresh_token", "client_id": app, "client_secret": secret, "refresh_token": refresh,
+            })
+        except SourceError as error:
+            if getattr(error, "provider_code", None) not in {20010, 20026, 20037}:
+                raise
+            db.execute("UPDATE feishu_user_authorization SET refresh_ciphertext=NULL, refresh_expires_at=NULL "
+                       "WHERE role=%s AND account_id=%s", actor.key)
+            return None
+        access, lifetime = data.get("access_token"), data.get("expires_in")
+        rotated, refresh_lifetime = refresh_grant(data)
+        if not isinstance(access, str) or not access or type(lifetime) is not int or lifetime <= 30 or not rotated:
+            raise SourceError("飞书未返回可续期授权，请在账号页重新授权。", 409)
+        save_user_token(db, actor, app, access, lifetime - 30,
+                        refresh_token=rotated, refresh_lifetime=refresh_lifetime)
+        return access
 
 
 def personal_library(db, member_id, *, create=False):
@@ -392,7 +453,11 @@ def stage_feishu_import(db, token, url, target=None, heading=None, *, hybrid=Fal
             source["last_digest"] = None
         try:
             result = stage_source_snapshot(db, source, markdown, line_blocks)
-            cur.execute("UPDATE managed_source SET requested_by=%s WHERE id=%s", (actor.id, source["id"]))
+            cur.execute("""
+                UPDATE managed_source SET requested_by=%s, feishu_doc_token=%s, feishu_revision=NULL,
+                    sync_pending_version=NULL, sync_next_at=statement_timestamp() + interval '15 minutes'
+                WHERE id=%s
+            """, (actor.id, doc_id, source["id"]))
             if result["changed"]:
                 record_ingest(db, "feishu", result["version_id"], library, actor.id, title)
         except ManagementError as error:

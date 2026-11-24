@@ -272,6 +272,8 @@ def documents(db, library):
             SELECT d.document_id AS id, d.current_version, d.published, d.owner,
                    v.title, v.created_at AS updated_at, v.chunk_count, v.version_count,
                    s.id AS source_id, COALESCE(s.provider, 'upload') AS source,
+                   COALESCE(s.auto_sync, d.current_version <> '') AND s.provider='feishu' AS auto_sync,
+                   s.checked_at AS source_checked_at, s.last_error AS source_error, s.sync_requested,
                    """ + VISIBILITY_STATUS + """ AS visibility_status
             FROM source_document d
             JOIN LATERAL (

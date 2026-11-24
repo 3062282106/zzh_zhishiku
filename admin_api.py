@@ -23,6 +23,7 @@ from admin import (ManagementError, WebLoginError, access_contact_url, activate,
                    set_access_contact_url, set_availability, set_member_grants, set_member_state, set_owner, task_feed,
                    versions)
 from feishu_source import bind_feishu, fetch_feishu_section
+from feishu_sync import request_check
 from docling_parser import MAX_FILE, ParseError
 from file_ingest import SUPPORTED_SUFFIXES, jobs as file_jobs, queue as queue_file, queue_publication, retry as retry_file
 from notion_source import SourceError, bind_notion, list_sources, sync_source
@@ -268,7 +269,11 @@ class NotionSourceRequest(BaseModel):
 
 
 class FeishuSourceRequest(NotionSourceRequest):
-    section_heading: Title
+    section_heading: Title | None = None
+
+
+class SourceSyncRequest(BaseModel):
+    enabled: bool
 
 
 def router(hybrid):
@@ -587,8 +592,10 @@ def router(hybrid):
     @control.post("/libraries/{library}/sources/feishu", status_code=201)
     def add_feishu_source(library: str, payload: FeishuSourceRequest):
         try:
-            with connect() as db:
-                return bind_feishu(db, library, payload.url, payload.title, payload.section_heading)
+            with connect() as db, db.transaction():
+                source = bind_feishu(db, library, payload.url, payload.title, payload.section_heading)
+                request_check(db, source["id"], enabled=True)
+                return source
         except SourceError as error:
             raise HTTPException(error.status, str(error)) from None
 
@@ -596,9 +603,20 @@ def router(hybrid):
     def sync_online_source(identifier: UUID, identity: Annotated[dict, Depends(admin_identity)]):
         try:
             with connect() as db:
+                provider = db.execute("SELECT provider FROM managed_source WHERE id=%s", (identifier,)).fetchone()
+                if provider == ("feishu",):
+                    return request_check(db, identifier)
                 db.execute("UPDATE managed_source SET requested_by=%s WHERE id=%s AND NOT user_imported",
                            (identity["id"], identifier))
                 return sync_source(db, identifier, fetch_feishu_section)
+        except SourceError as error:
+            raise HTTPException(error.status, str(error)) from None
+
+    @control.put("/sources/{identifier}/auto-sync")
+    def configure_sync(identifier: UUID, payload: SourceSyncRequest):
+        try:
+            with connect() as db:
+                return request_check(db, identifier, enabled=payload.enabled)
         except SourceError as error:
             raise HTTPException(error.status, str(error)) from None
 

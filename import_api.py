@@ -19,13 +19,14 @@ from pydantic import BaseModel, StringConstraints
 
 from access import connect, token_hash
 from admin import ManagementError, activate, delete_document, documents, preview, set_availability, versions
-from admin_api import Title, admin_identity, reader_identity
-from agent_import import (CALLBACK, OAuthFailure, admin_import_access, begin_oauth, complete_oauth,
+from admin_api import SourceSyncRequest, Title, admin_identity, reader_identity
+from agent_import import (CALLBACK, OAuthFailure, admin_import_access, authorization_status, begin_oauth, complete_oauth,
                           console_path, import_identity, issue_admin_import_token, oauth_requests,
                           personal_library, set_admin_import_access, stage_feishu_import, target_library,
-                          upload_enabled, uploadable_libraries, user_token, web_importer)
+                          upload_enabled, uploadable_libraries, web_importer)
 from docling_parser import MAX_FILE, ParseError
 from feishu_source import parse_link
+from feishu_sync import request_check
 from file_ingest import SUPPORTED_SUFFIXES, file_status, jobs as file_jobs, queue as queue_file
 from notion_source import SourceError
 
@@ -244,17 +245,17 @@ def router(hybrid):
         try:
             with connect() as db:
                 actor = web_importer(db, token)
-                return {"authorized": bool(user_token(db, actor)), "upload_enabled": upload_enabled(db, actor),
+                return {**authorization_status(db, actor), "upload_enabled": upload_enabled(db, actor),
                         "email": actor.email}
         except SourceError as error:
             raise translate(error) from None
 
     @routes.post("/v1/knowledge/feishu/authorize")
-    def authorize_feishu(token: Session, response: Response):
+    def authorize_feishu(token: Session, response: Response, offline: bool = False):
         try:
             state = token_urlsafe(32)
             with connect() as db:
-                url = begin_oauth(db, token, state)
+                url = begin_oauth(db, token, state, offline=offline)
         except SourceError as error:
             raise translate(error) from None
         response.headers["Cache-Control"] = "no-store"
@@ -319,6 +320,32 @@ def router(hybrid):
                 library = personal_library(db, actor.id, create=True)
                 return queue_new_file(db, library, file.filename or "", data, actor, title, upload_id=upload_id)
         except ManagementError as error:
+            raise translate(error) from None
+
+    def queue_personal_sync(db, token, document, enabled=None):
+        actor = personal_writer(db, token)
+        owned_document(db, actor, document)
+        source = db.execute("""
+            SELECT id FROM managed_source WHERE document_platform='upload' AND document_id=%s AND provider='feishu'
+        """, (str(document),)).fetchone()
+        if not source:
+            raise SourceError("此文档没有飞书同步来源。", 404)
+        return request_check(db, source[0], enabled=enabled)
+
+    @routes.post("/v1/knowledge/personal/{document}/sync", status_code=202)
+    def check_personal_source(document: UUID, token: Session):
+        try:
+            with connect() as db:
+                return queue_personal_sync(db, token, document)
+        except SourceError as error:
+            raise translate(error) from None
+
+    @routes.put("/v1/knowledge/personal/{document}/auto-sync")
+    def configure_personal_sync(document: UUID, payload: SourceSyncRequest, token: Session):
+        try:
+            with connect() as db:
+                return queue_personal_sync(db, token, document, payload.enabled)
+        except SourceError as error:
             raise translate(error) from None
 
     @routes.delete("/v1/knowledge/personal/{document}")

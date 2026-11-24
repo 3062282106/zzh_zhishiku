@@ -232,17 +232,22 @@ def render_section(blocks, root, selected):
     return "\n".join(lines), line_blocks
 
 
-def fetch_feishu_document(link, selected, access_token):
+def document_revision(link, access_token):
     kind, token, _ = parse_link(link)
     document_id = get_document_id(kind, token, access_token)
     document = call(f"/docx/v1/documents/{document_id}", access_token).get("data", {}).get("document", {})
     revision = document.get("revision_id")
     if type(revision) is not int or revision < 1:
         raise SourceError("飞书没有返回可校验的文档版本。")
-    markdown, line_blocks = render_section(list_blocks(document_id, revision, access_token), document_id, selected)
     title = document.get("title")
     title = title.strip()[:160] if isinstance(title, str) else ""
-    return document_id, title or "飞书云文档", markdown, line_blocks
+    return document_id, revision, title or "飞书云文档"
+
+
+def fetch_feishu_document(link, selected, access_token):
+    document_id, revision, title = document_revision(link, access_token)
+    markdown, line_blocks = render_section(list_blocks(document_id, revision, access_token), document_id, selected)
+    return document_id, title, markdown, line_blocks
 
 
 def fetch_feishu_section(link, selected):

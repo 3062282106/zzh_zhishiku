@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS managed_source (
 );
 ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS section_heading text;
 ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS user_imported boolean NOT NULL DEFAULT false;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS auto_sync boolean;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS sync_requested boolean NOT NULL DEFAULT false;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS sync_next_at timestamptz;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS sync_pending_version uuid;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS feishu_doc_token text;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS feishu_revision bigint;
+CREATE INDEX IF NOT EXISTS managed_feishu_sync_due ON managed_source(sync_next_at, id) WHERE provider='feishu';
 CREATE TABLE IF NOT EXISTS managed_availability_event (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     document_id text NOT NULL,
@@ -222,6 +229,8 @@ CREATE TABLE IF NOT EXISTS feishu_user_authorization (
     PRIMARY KEY (role, account_id)
 );
 CREATE INDEX IF NOT EXISTS feishu_user_authorization_expiry ON feishu_user_authorization(expires_at);
+ALTER TABLE feishu_user_authorization ADD COLUMN IF NOT EXISTS refresh_ciphertext bytea;
+ALTER TABLE feishu_user_authorization ADD COLUMN IF NOT EXISTS refresh_expires_at timestamptz;
 CREATE TABLE IF NOT EXISTS console_setting (
     key text PRIMARY KEY,
     value text NOT NULL

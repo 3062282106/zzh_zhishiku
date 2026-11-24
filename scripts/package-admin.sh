@@ -14,10 +14,10 @@ fi
 # Keep this list in sync with `files` in scripts/deploy-admin.sh and REQUIRED in
 # scripts/deploy-admin-ssh.py: the server copies exactly these.
 files=(
-  access.py admin.py admin_api.py admin_schema.sql agent_import.py api.py docling_parser.py feishu_source.py file_ingest.py
+  access.py admin.py admin_api.py admin_schema.sql agent_import.py api.py docling_parser.py feishu_source.py feishu_sync.py file_ingest.py
   import_api.py mcp_server.py notion_source.py search.py schema.sql
   scripts/deploy-admin.sh scripts/verify-admin-cloud.py scripts/configure-notion.sh
-  scripts/configure-mcp-entry.sh scripts/configure-admin-entry.sh
+  scripts/configure-mcp-entry.sh scripts/configure-admin-entry.sh scripts/configure-feishu-sync.sh
 )
 
 for file in "${files[@]}"; do

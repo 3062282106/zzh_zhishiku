@@ -37,6 +37,7 @@ const busy = ref(false);
 const error = ref("");
 const notice = ref("");
 const current = computed(() => selected.value?.versions.find((row) => row.id === selected.value.version));
+const selectedFile = computed(() => files.value.find((file) => file.id === selected.value?.document));
 
 function loadFiles() {
   refreshPromise ||= knowledgeApi("/personal").then((personal) => {
@@ -104,12 +105,12 @@ async function switchVisibility(file) {
 
 onMounted(async () => {
   timer = setInterval(() => {
-    if (jobs.value.some(isProcessing)) loadFiles().catch(() => {});
+    if (jobs.value.some(isProcessing) || files.value.some((file) => file.sync_requested)) loadFiles().catch(() => {});
   }, 3000);
   try {
     const { feishu, document, version } = route.query;
     if (feishu) {
-      if (feishu === "ok") notice.value = "飞书已授权，可以回到 Agent 导入。";
+      if (feishu === "ok") notice.value = "飞书已授权。";
       else error.value = feishuError(feishu, route.query.feishu_code);
       router.replace({ query: { personal: "1" } });
     }
@@ -123,15 +124,32 @@ onMounted(async () => {
 });
 onUnmounted(() => clearInterval(timer));
 
-async function authorize() {
+async function authorize(offline = false) {
   if (busy.value) return;
   busy.value = true;
   error.value = "";
   try {
-    const result = await knowledgeApi("/feishu/authorize", { method: "POST" });
+    const result = await knowledgeApi("/feishu/authorize" + (offline ? "?offline=true" : ""), { method: "POST" });
     window.location.assign(result.url);
   } catch (problem) {
     error.value = problem.message;
+    busy.value = false;
+  }
+}
+
+async function syncFile(file, enabled = null) {
+  if (busy.value) return;
+  busy.value = true;
+  error.value = "";
+  const path = "/personal/" + enc(file.id);
+  try {
+    if (enabled === null) await knowledgeApi(path + "/sync", { method: "POST" });
+    else await knowledgeApi(path + "/auto-sync", { method: "PUT", body: { enabled } });
+    notice.value = enabled === false ? "已暂停自动同步。" : "检查已排队。";
+    await loadFiles();
+  } catch (problem) {
+    error.value = problem.message;
+  } finally {
     busy.value = false;
   }
 }
@@ -184,9 +202,11 @@ async function publish() {
     <header class="personal-head">
       <h1>个人知识库</h1>
       <div v-if="status?.upload_enabled" class="personal-actions">
-        <button class="btn" :disabled="busy" @click="authorize">
+        <button class="btn" :disabled="busy" @click="authorize(status.auto_sync_authorized)">
           {{ status.authorized ? "重新授权飞书" : "授权飞书" }}
         </button>
+        <button v-if="!status.auto_sync_authorized && files.some(file => file.source === 'feishu')"
+                class="btn" :disabled="busy" @click="authorize(true)">授权自动同步</button>
         <button class="btn primary" :disabled="busy" @click="uploadOpen = true">上传文档</button>
       </div>
     </header>
@@ -203,6 +223,10 @@ async function publish() {
           <tr v-for="file in rows" :key="file.id">
             <td>
               <b>{{ file.title }}</b>
+              <div v-if="file.source === 'feishu'" class="t-sub">
+                {{ file.sync_requested ? "飞书 · 待检查" : file.source_error ? "飞书 · 同步失败"
+                  : file.auto_sync ? "飞书 · 自动同步" : "飞书 · 已暂停" }}
+              </div>
               <div v-if="file.job?.last_error || file.job?.publication_error" class="t-sub">
                 {{ file.job.last_error || file.job.publication_error }}
               </div>
@@ -224,6 +248,19 @@ async function publish() {
   </section>
   <UploadDrawer v-if="uploadOpen" personal @close="uploadOpen = false" @uploaded="uploaded" />
   <Drawer v-if="selected" :title="selected.title" @close="close">
+    <div v-if="selectedFile?.source === 'feishu'" class="block">
+      <div class="k">同步飞书原文</div>
+      <div class="v">
+        {{ selectedFile.source_checked_at ? "最近检查 " + fmtTime(selectedFile.source_checked_at) : "尚未检查" }}
+      </div>
+      <p v-if="selectedFile.source_error" class="personal-error">{{ selectedFile.source_error }}</p>
+      <div v-if="status?.upload_enabled" class="personal-sync">
+        <button class="btn sm" :disabled="busy || selectedFile.sync_requested" @click="syncFile(selectedFile)">立即检查</button>
+        <button class="btn ghost sm" :disabled="busy" @click="syncFile(selectedFile, !selectedFile.auto_sync)">
+          {{ selectedFile.auto_sync ? "暂停同步" : "开启自动同步" }}
+        </button>
+      </div>
+    </div>
     <div class="field">
       <label for="personal-version">文档版本</label>
       <select id="personal-version" :value="selected.version" :disabled="busy" @change="select(selected.document, $event.target.value)">
@@ -246,6 +283,7 @@ async function publish() {
 .personal-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .personal-head h1 { font-size: 26px; }
 .personal-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+.personal-sync { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .personal-error { color: var(--red); margin: 12px 0; }
 .original { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.7; }
 </style>
