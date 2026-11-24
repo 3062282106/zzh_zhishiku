@@ -3,6 +3,7 @@
 from base64 import urlsafe_b64encode
 from dataclasses import dataclass
 from hashlib import sha256
+import logging
 import os
 from secrets import token_urlsafe
 from threading import Lock
@@ -202,31 +203,55 @@ def begin_oauth(db, token, state):
     verifier = token_urlsafe(48)
     challenge = urlsafe_b64encode(sha256(verifier.encode()).digest()).decode().rstrip("=")
     oauth_requests.put(state, OAuthRequest(actor, token, verifier, redirect), 300)
-    query = urlencode({"client_id": app, "redirect_uri": redirect, "scope": SCOPES, "state": state,
+    query = urlencode({"client_id": app, "response_type": "code", "redirect_uri": redirect, "scope": SCOPES, "state": state,
                        "code_challenge": challenge, "code_challenge_method": "S256", "prompt": "consent"})
     return ACCOUNTS + "/open-apis/authen/v1/authorize?" + query
 
 
+class OAuthFailure(SourceError):
+    def __init__(self, reason, provider_code=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.provider_code = provider_code
+
+
+def oauth_call(step, path, **options):
+    try:
+        return call(path, **options)
+    except SourceError as error:
+        provider_code = getattr(error, "provider_code", None)
+        logging.getLogger(__name__).warning(
+            "Feishu OAuth failed at %s (status=%s, provider_code=%s): %s",
+            step, getattr(error, "http_status", error.status), provider_code, error,
+        )
+        raise OAuthFailure(step, provider_code) from None
+
+
 def complete_oauth(db, pending, code):
     if web_importer(db, pending.web_token) != pending.actor or not upload_enabled(db, pending.actor):
-        raise SourceError("知识库登录或上传权限已失效，请重新授权。", 403)
+        raise OAuthFailure("session")
     app, secret, redirect = oauth_settings()
     if redirect != pending.redirect:
         raise SourceError("飞书授权配置已变更，请重试。", 409)
-    data = call("/oauth/v3/token", body={
+    data = oauth_call("token", "/oauth/v3/token", body={
         "grant_type": "authorization_code", "client_id": app, "client_secret": secret,
         "code": code, "redirect_uri": redirect, "code_verifier": pending.verifier,
     }, origin=ACCOUNTS)
     access_token, expires_in = data.get("access_token"), data.get("expires_in")
     if not isinstance(access_token, str) or not access_token or type(expires_in) is not int or expires_in <= 30:
-        raise SourceError("飞书未返回有效的用户授权，请重新授权。", 409)
-    info = call("/authen/v1/user_info", access_token).get("data", {})
+        logging.getLogger(__name__).warning("Feishu OAuth token response lacks a usable token or expiry")
+        raise OAuthFailure("token")
+    info = oauth_call("identity", "/authen/v1/user_info", token=access_token).get("data", {})
+    if not isinstance(info, dict):
+        raise OAuthFailure("identity")
     email = info.get("enterprise_email") or info.get("email")
     email = email.strip().lower() if isinstance(email, str) else ""
+    if not email:
+        raise OAuthFailure("email_missing")
     if email != pending.actor.email:
-        raise SourceError("飞书邮箱与知识库账号的企业邮箱不一致。", 403)
+        raise OAuthFailure("mismatch")
     if web_importer(db, pending.web_token) != pending.actor or not upload_enabled(db, pending.actor):
-        raise SourceError("知识库登录或上传权限已失效，请重新授权。", 403)
+        raise OAuthFailure("session")
     feishu_tokens.put(pending.actor.key, (email, access_token), min(7200, expires_in - 30))
 
 

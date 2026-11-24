@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { enc, knowledgeApi } from "../api";
+import { enc, feishuError, knowledgeApi } from "../api";
 import { fmtTime } from "../format";
 import Drawer from "../components/Drawer.vue";
 
@@ -27,7 +27,7 @@ onMounted(async () => {
     const { feishu, document, version } = route.query;
     if (feishu) {
       if (feishu === "ok") notice.value = "飞书已授权，可以回到 Agent 导入。";
-      else error.value = feishu === "mismatch" ? "飞书邮箱与知识库账号的企业邮箱不一致。" : "飞书授权未完成，请重试。";
+      else error.value = feishuError(feishu, route.query.feishu_code);
       router.replace({ query: { personal: "1" } });
     }
     await load();

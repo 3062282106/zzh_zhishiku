@@ -34,6 +34,13 @@ def bind_feishu(db, library, link, title, heading):
     return bind_source(db, library, "feishu", kind + ":" + token, canonical, title, heading)
 
 
+class FeishuAPIError(SourceError):
+    def __init__(self, message, status=502, *, provider_code=None, http_status=None):
+        super().__init__(message, status)
+        self.provider_code = provider_code
+        self.http_status = http_status
+
+
 def call(path, token=None, body=None, *, origin=API):
     headers = {"Accept": "application/json"}
     if token:
@@ -48,9 +55,17 @@ def call(path, token=None, body=None, *, origin=API):
             raise SourceError("飞书返回的数据过大，请缩小来源范围。", 422)
         payload = json.loads(raw)
     except HTTPError as error:
+        try:
+            detail = json.loads(error.read(MAX_RESPONSE + 1))
+            provider_code = detail.get("code") if isinstance(detail, dict) else None
+        except (ValueError, OSError):
+            provider_code = None
+        provider_code = provider_code if type(provider_code) is int else None
         if error.code in (401, 403, 404):
-            raise SourceError("飞书拒绝访问，请检查当前飞书账号的文档权限或应用授权。", 409) from None
-        raise SourceError(f"飞书请求失败（HTTP {error.code}），本次没有同步。") from None
+            raise FeishuAPIError("飞书拒绝访问，请检查当前飞书账号的文档权限或应用授权。", 409,
+                                 provider_code=provider_code, http_status=error.code) from None
+        raise FeishuAPIError(f"飞书请求失败（HTTP {error.code}）。",
+                             provider_code=provider_code, http_status=error.code) from None
     except (URLError, TimeoutError, UnicodeError, json.JSONDecodeError):
         raise SourceError("暂时无法读取飞书，请稍后重试。", 503) from None
     if not isinstance(payload, dict):
@@ -59,7 +74,8 @@ def call(path, token=None, body=None, *, origin=API):
     if type(code) is not int:
         raise SourceError("飞书返回了无法识别的状态。")
     if code:
-        raise SourceError(f"飞书拒绝了请求（错误码 {code}）。请检查应用是否发布、权限是否生效及文档是否已授权。", 409)
+        raise FeishuAPIError(f"飞书拒绝了请求（错误码 {code}）。请检查应用是否发布、权限是否生效及文档是否已授权。",
+                             409, provider_code=code)
     return payload
 
 

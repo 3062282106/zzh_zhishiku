@@ -1,7 +1,9 @@
 """MCP import and owner-only draft management endpoints."""
 
+import logging
 from secrets import compare_digest, token_urlsafe
 from typing import Annotated
+from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -11,7 +13,7 @@ from pydantic import BaseModel, StringConstraints
 from access import connect
 from admin import ManagementError, activate, documents, preview, versions
 from admin_api import Title, admin_identity, reader_identity
-from agent_import import (CALLBACK, admin_import_access, begin_oauth, complete_oauth,
+from agent_import import (CALLBACK, OAuthFailure, admin_import_access, begin_oauth, complete_oauth,
                           console_path, issue_admin_import_token, oauth_requests,
                           personal_library, set_admin_import_access, stage_feishu_import,
                           upload_enabled, user_token, web_importer)
@@ -112,14 +114,21 @@ def router(hybrid):
             raise HTTPException(400, "飞书授权请求已过期，请从知识库网页重试。",
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         result = "cancelled"
+        query = {}
         if code and len(code) <= 2048:
             try:
                 with connect() as db:
                     complete_oauth(db, pending, code)
                 result = "ok"
+            except OAuthFailure as error:
+                result = error.reason
+                if error.provider_code is not None:
+                    query["feishu_code"] = error.provider_code
             except SourceError as error:
-                result = "mismatch" if str(error).startswith("飞书邮箱") else "failed"
-        response = RedirectResponse(console_path(pending.actor) + "?feishu=" + result, status_code=303,
+                result = "session" if error.status == 401 else "failed"
+                logging.getLogger(__name__).warning("Feishu OAuth callback failed (status=%s): %s", error.status, error)
+        query["feishu"] = result
+        response = RedirectResponse(console_path(pending.actor) + "?" + urlencode(query), status_code=303,
                                     headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         response.delete_cookie(FLOW_COOKIE, path=CALLBACK, secure=True, httponly=True, samesite="lax")
         return response

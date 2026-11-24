@@ -54,6 +54,19 @@ async function request(path, options = {}) {
   return data;
 }
 
+export function feishuError(status, code) {
+  const messages = {
+    mismatch: "飞书邮箱与知识库账号的企业邮箱不一致。",
+    email_missing: "飞书没有返回邮箱。请确认当前飞书账号已设置企业邮箱，并检查应用的两项用户身份邮箱权限已发布。",
+    token: "知识库在换取飞书授权凭据时失败。",
+    identity: "知识库读取飞书账号信息时失败。",
+    session: "知识库登录或上传权限已失效，请重新登录后授权。",
+    cancelled: "飞书没有返回授权结果，请重新授权。",
+  };
+  const message = messages[status] || "飞书授权未完成，请重试。";
+  return /^\d{1,12}$/.test(String(code)) ? message + "（飞书错误码 " + code + "）" : message;
+}
+
 export const api = (path, options) => request("/v1/admin" + path, options);
 export const sessionApi = (path, options) => request("/v1/session" + path, options);
 export const knowledgeApi = (path, options) => request("/v1/knowledge" + path, options);
