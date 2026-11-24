@@ -149,7 +149,7 @@ cat scripts/configure-admin-entry.sh | ssh root@47.120.35.20 \
 
 - 在飞书开放平台为现有企业自建应用开通用户身份权限 `docx:document:readonly`、`wiki:wiki:readonly`、`contact:user.email:readonly`、`contact:user.employee:readonly`，并发布应用版本。
 - 在飞书「安全设置」登记 HTTPS 重定向 URL `https://admin.zzh-resume.online/v1/knowledge/feishu/callback`，并在 ECS 的 `/etc/knowledge-kb/api.env` 将 `KB_FEISHU_OAUTH_REDIRECT_URI` 设为同一个地址，重启 API。复用现有 `KB_FEISHU_APP_ID` 和 `KB_FEISHU_APP_SECRET`。更新管理域名的 nginx 配置，使授权回调路径关闭访问日志，避免记录授权码。
-- 「运维管理 / 成员与权限」可开通成员个人库上传，管理员需保存企业邮箱并勾选可导入的企业库。同一个 MCP 连接器支持查询和导入。管理员可用已签发的管理员 MCP 令牌，在勾选的企业库检索并提交草稿。成员继续用自己的 MCP 令牌。用户在网页点击「授权飞书」，有效期内的用户凭证加密保存在 PostgreSQL，API 重启后可以继续使用。部署脚本首次生成 `KB_FEISHU_TOKEN_KEY` 并保存在受限的 `api.env`，密钥更换后需要重新授权。飞书授权到期后需重新授权。
+- 「运维管理 / 成员与权限」可开通成员个人库上传，管理员需保存企业邮箱并勾选可导入的企业库。同一个 MCP 连接器支持查询和导入。管理员可用已签发的管理员 MCP 令牌，在勾选的企业库检索和上传。成员继续用自己的 MCP 令牌。用户在网页点击「授权飞书」，有效期内的用户凭证加密保存在 PostgreSQL，API 重启后可以继续使用。部署脚本首次生成 `KB_FEISHU_TOKEN_KEY` 并保存在受限的 `api.env`，密钥更换后需要重新授权。飞书授权到期后需重新授权。
 - 在 Agent 中用 `import_feishu_document` 提交具体飞书 Docx 或指向 Docx 的 Wiki 链接。只需要导入某一章节时可提供完整标题。个人库和企业库的直接上传及 MCP 导入自动构建索引并发布。管理员必须明确指定企业库，Agent 可通过 `list_upload_libraries` 展示有权限的选项。旧草稿仍可手动发布。长文档在后台处理，Agent 用 `get_feishu_import_status` 查询结果。当前上限为 12,000 个飞书块、16 MiB 的分页数据和 2,000 个检索分块。导入任务在 API 进程中执行，服务重启中断时重新发同一链接即可。
 
 ---
