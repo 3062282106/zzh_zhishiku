@@ -1,22 +1,27 @@
 """MCP import and owner-only draft management endpoints."""
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import logging
 from secrets import compare_digest, token_urlsafe
+from threading import Lock
+from time import monotonic
 from typing import Annotated
 from urllib.parse import urlencode
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, StringConstraints
 
-from access import connect
+from access import connect, token_hash
 from admin import ManagementError, activate, documents, preview, versions
 from admin_api import Title, admin_identity, reader_identity
 from agent_import import (CALLBACK, OAuthFailure, admin_import_access, begin_oauth, complete_oauth,
-                          console_path, issue_admin_import_token, oauth_requests,
-                          personal_library, set_admin_import_access, stage_feishu_import,
+                          console_path, import_identity, issue_admin_import_token, oauth_requests,
+                          personal_library, set_admin_import_access, stage_feishu_import, target_library,
                           upload_enabled, user_token, web_importer)
+from feishu_source import parse_link
 from notion_source import SourceError
 
 
@@ -30,6 +35,51 @@ class FeishuImport(BaseModel):
     url: LINK
     library: Title | None = None
     section_heading: Title | None = None
+
+
+@dataclass
+class ImportJob:
+    key: tuple
+    created_at: float
+    future: Future
+
+
+import_workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-import")
+import_jobs: dict[UUID, ImportJob] = {}
+import_jobs_lock = Lock()
+
+
+def run_import(token, url, library, heading, hybrid):
+    with connect() as db:
+        return stage_feishu_import(db, token, url, library, heading, hybrid=hybrid)
+
+
+def submit_import(token, url, library, heading, hybrid):
+    key = (token_hash(token), url, library, heading)
+    now = monotonic()
+    with import_jobs_lock:
+        for job_id, job in list(import_jobs.items()):
+            if job.future.done() and (now - job.created_at > 3600 or len(import_jobs) >= 128):
+                del import_jobs[job_id]
+        active = [item for item in import_jobs.items() if not item[1].future.done()]
+        for job_id, job in active:
+            if job.key == key:
+                return job_id, job
+        if len(active) >= 6:
+            raise SourceError("飞书导入队列已满，请稍后再试。", 429)
+        job_id = uuid4()
+        job = ImportJob(key, now, import_workers.submit(run_import, token, url, library, heading, hybrid))
+        import_jobs[job_id] = job
+        return job_id, job
+
+
+def import_outcome(job_id, job):
+    try:
+        return job.future.result(timeout=6)
+    except TimeoutError:
+        if job.future.done():
+            return job.future.result()
+        return {"status": "processing", "job_id": str(job_id), "message": "正在后台导入，可查询任务进度。"}
 
 
 class AdminImportAccess(BaseModel):
@@ -75,8 +125,24 @@ def router(hybrid):
         response.headers["Cache-Control"] = "no-store"
         try:
             with connect() as db:
-                return stage_feishu_import(db, token, payload.url, payload.library, payload.section_heading,
-                                           hybrid=hybrid)
+                target_library(db, import_identity(db, token), payload.library)
+            _, _, url = parse_link(payload.url)
+            job_id, job = submit_import(token, url, payload.library, payload.section_heading, hybrid)
+            return import_outcome(job_id, job)
+        except SourceError as error:
+            raise translate(error) from None
+
+    @routes.get("/v1/knowledge/imports/feishu/{job_id}")
+    def feishu_import_status(job_id: UUID, token: Session, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        with import_jobs_lock:
+            job = import_jobs.get(job_id)
+        if job is None or not compare_digest(job.key[0], token_hash(token)):
+            raise HTTPException(404, "找不到此导入任务。请重新提交飞书链接。")
+        try:
+            with connect() as db:
+                target_library(db, import_identity(db, token), job.key[2])
+            return import_outcome(job_id, job)
         except SourceError as error:
             raise translate(error) from None
 

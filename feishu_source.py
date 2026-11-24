@@ -13,6 +13,9 @@ API = "https://open.feishu.cn/open-apis"
 TOKEN = re.compile(r"[A-Za-z0-9]{8,80}")
 HEADER = re.compile(r"heading([1-9])")
 TEXT_KEYS = ("text", "bullet", "ordered", "code", "quote", "todo")
+MAX_DOCUMENT_BLOCKS = 12_000
+MAX_BLOCK_PAGES = 120
+MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 
 
 def parse_link(link):
@@ -106,12 +109,16 @@ def get_document_id(kind, token, access_token):
 
 def list_blocks(document_id, revision, access_token):
     blocks, seen = {}, set()
+    total_bytes = 0
     params = {"page_size": 200, "document_revision_id": revision}
-    for _ in range(12):
+    for _ in range(MAX_BLOCK_PAGES):
         result = call(f"/docx/v1/documents/{document_id}/blocks?" + urlencode(params), access_token).get("data", {})
         items = result.get("items")
         if not isinstance(items, list):
             raise SourceError("飞书云文档块返回格式不完整。")
+        total_bytes += len(json.dumps(items, ensure_ascii=False).encode("utf-8"))
+        if len(blocks) + len(items) > MAX_DOCUMENT_BLOCKS or total_bytes > MAX_DOCUMENT_BYTES:
+            raise SourceError("飞书文档超过 12,000 个块或 16 MiB 的导入容量。", 422)
         for item in items:
             block_id = item.get("block_id", "")
             if not TOKEN.fullmatch(block_id) or block_id in blocks:
@@ -124,7 +131,7 @@ def list_blocks(document_id, revision, access_token):
             raise SourceError("飞书云文档分页结果不完整。")
         seen.add(marker)
         params["page_token"] = marker
-    raise SourceError("飞书文档块数超过当前同步上限，请使用较小的同步文档。", 422)
+    raise SourceError("飞书文档的分页读取超过 120 页。", 422)
 
 
 def heading(block):

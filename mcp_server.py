@@ -42,7 +42,7 @@ def request(path, token, body=None):
         with OPENER.open(Request(BASE_URL + path, data=data, headers=headers), timeout=50) as response:
             return json.load(response)
     except HTTPError as error:
-        if path == "/v1/knowledge/imports/feishu":
+        if path.startswith("/v1/knowledge/imports/feishu"):
             try:
                 detail = json.load(error).get("detail")
             except (OSError, ValueError):
@@ -97,10 +97,18 @@ def create_server(get_token):
         """仅在用户明确要求入库时使用。个人知识库导入后自动发布，企业知识库导入为草稿。
         普通成员留空 library 或填写「个人知识库」。有授权的管理员必须明确指定企业库名称或 ID。
         未提供章节时读取整篇。authorization_required 时请把网页授权链接交给用户，授权后重试。
+        processing 时用 get_feishu_import_status 和返回的 job_id 查询进度。
         published 表示已可检索。publication_failed 表示个人文档已导入但索引未完成，可重新导入重试。"""
         return tool_result(request("/v1/knowledge/imports/feishu", get_token(), {
             "url": url, "library": library, "section_heading": section_heading,
         }))
+
+    @server.tool(annotations=read_only)
+    def get_feishu_import_status(
+        job_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9-]{36}$")],
+    ) -> CallToolResult:
+        """查询自己提交的飞书导入任务。processing 表示后台正在处理。发布完成后可检索个人内容。"""
+        return tool_result(request(f"/v1/knowledge/imports/feishu/{job_id}", get_token()))
 
     return server
 

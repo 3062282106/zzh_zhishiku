@@ -351,6 +351,7 @@ def upload(db, library, document, title, filename, original, metadata=None, *,
     source = source_url or f"/v1/knowledge/originals/{document}/{version}"
     metadata = normalize(metadata)
     chunks = []
+    limit = 2_000 if provider == "feishu" else 200
     for unit in notion_units(original):
         for part, text in enumerate(split_text(unit.text), 1):
             locator = {**unit.locator, "part": part}
@@ -358,6 +359,8 @@ def upload(db, library, document, title, filename, original, metadata=None, *,
             if block_id:
                 locator["block_id"] = block_id
             chunk_id = sha256(f"{version}:{json.dumps(locator, sort_keys=True)}".encode()).hexdigest()
+            if len(chunks) == limit:
+                raise ManagementError(f"此文档超过 {limit:,} 个检索分块的导入容量。")
             chunks.append({
                 "chunk_id": chunk_id, "platform": provider, "document_id": document,
                 "document_version": str(version), "title": title, "heading_path": list(unit.heading),
@@ -367,8 +370,6 @@ def upload(db, library, document, title, filename, original, metadata=None, *,
             })
     if not chunks:
         raise ManagementError("文档没有可以检索的正文。")
-    if len(chunks) > 200:
-        raise ManagementError("此文档超过 200 个分块，请拆成多份上传。")
     return save_version(db, library, document, version, title, filename, original, chunks,
                         online=source_url is not None)
 
