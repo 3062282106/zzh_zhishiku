@@ -18,13 +18,13 @@ test -s "$envfile"
 systemctl is-active --quiet knowledge-kb-api.service
 systemctl is-active --quiet knowledge-kb-mcp.service
 
-files=(access.py admin.py admin_api.py admin_schema.sql api.py docling_parser.py feishu_source.py file_ingest.py
-       mcp_server.py notion_source.py search.py schema.sql)
+files=(access.py admin.py admin_api.py admin_schema.sql agent_import.py api.py docling_parser.py feishu_source.py file_ingest.py
+       import_api.py mcp_server.py notion_source.py search.py schema.sql)
 for file in "${files[@]}"; do
   test -s "$release/$file"
 done
 "$app/.venv/bin/python" -m py_compile \
-  "$release"/{access.py,admin.py,admin_api.py,api.py,docling_parser.py,feishu_source.py,file_ingest.py,mcp_server.py,notion_source.py,search.py}
+  "$release"/{access.py,admin.py,admin_api.py,agent_import.py,api.py,docling_parser.py,feishu_source.py,file_ingest.py,import_api.py,mcp_server.py,notion_source.py,search.py}
 
 # The console is a Vite build served from web/dist. Build it before packaging:
 #   npm --prefix web ci && npm --prefix web run build

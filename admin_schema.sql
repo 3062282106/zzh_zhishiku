@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS managed_source (
     FOREIGN KEY (document_platform, document_id) REFERENCES source_document(platform, document_id)
 );
 ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS section_heading text;
+ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS user_imported boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS managed_availability_event (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     document_id text NOT NULL,
@@ -91,6 +92,7 @@ ALTER TABLE source_document ADD COLUMN IF NOT EXISTS owner text;
 ALTER TABLE member_account ADD COLUMN IF NOT EXISTS display_name text;
 ALTER TABLE member_account ADD COLUMN IF NOT EXISTS email text;
 ALTER TABLE member_account ADD COLUMN IF NOT EXISTS kind text;
+ALTER TABLE member_account ADD COLUMN IF NOT EXISTS personal_upload boolean NOT NULL DEFAULT false;
 ALTER TABLE knowledge_grant ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 CREATE INDEX IF NOT EXISTS knowledge_grant_by_library ON knowledge_grant(kb_id, member_id);
 
@@ -124,6 +126,17 @@ CREATE TABLE IF NOT EXISTS admin_account (
 -- Session tokens are stored hashed for the same reason member tokens are: a database
 -- dump must not hand anyone a working credential. Expiry is checked on read, so a
 -- stale row is harmless even before the next cleanup pass.
+ALTER TABLE admin_account ADD COLUMN IF NOT EXISTS email text;
+CREATE UNIQUE INDEX IF NOT EXISTS admin_account_email_unique ON admin_account(lower(email)) WHERE email IS NOT NULL;
+CREATE TABLE IF NOT EXISTS admin_upload_grant (
+    admin_id text NOT NULL REFERENCES admin_account(id) ON DELETE CASCADE,
+    library text NOT NULL REFERENCES knowledge_base(id),
+    PRIMARY KEY (admin_id, library)
+);
+CREATE TABLE IF NOT EXISTS admin_import_token (
+    admin_id text PRIMARY KEY REFERENCES admin_account(id) ON DELETE CASCADE,
+    token_hash text NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS admin_session (
     token_hash text PRIMARY KEY,
     admin_id text NOT NULL REFERENCES admin_account(id) ON DELETE CASCADE,

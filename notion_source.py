@@ -87,7 +87,8 @@ def fetch_notion_markdown(page_id):
 def list_sources(db, library):
     with db.cursor(row_factory=dict_row) as cur:
         return cur.execute("""
-            SELECT id, provider, source_url, title, document_id, last_version_id, checked_at, last_error, section_heading
+            SELECT id, provider, source_url, title, document_id, last_version_id, checked_at, last_error, section_heading,
+                   user_imported
             FROM managed_source WHERE library=%s ORDER BY title, id
         """, (library,)).fetchall()
 
@@ -98,7 +99,7 @@ def bind_notion(db, library, link, title):
     return bind_source(db, library, "notion", page, url, title)
 
 
-def bind_source(db, library, provider, external_id, url, title, heading=None):
+def bind_source(db, library, provider, external_id, url, title, heading=None, *, user_imported=False):
     identifier, document = uuid4(), str(uuid4())
     with db.transaction():
         if not db.execute("SELECT 1 FROM knowledge_base WHERE id=%s", (library,)).fetchone():
@@ -109,13 +110,31 @@ def bind_source(db, library, provider, external_id, url, title, heading=None):
         """, (document, library))
         bound = db.execute("""
             INSERT INTO managed_source
-                (id, library, document_id, provider, external_id, source_url, title, section_heading)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (id, library, document_id, provider, external_id, source_url, title, section_heading, user_imported)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (library, provider, external_id) DO NOTHING RETURNING id
-        """, (identifier, library, document, provider, external_id, url, title, heading)).fetchone()
+        """, (identifier, library, document, provider, external_id, url, title, heading, user_imported)).fetchone()
         if not bound:
             raise SourceError("此来源已经绑定到当前知识库。", 409)
     return {"id": identifier, "document_id": document, "source_url": url}
+
+
+def stage_source_snapshot(db, source, markdown, line_blocks):
+    markdown = markdown.replace("\r\n", "\n")
+    snapshot = json.dumps([markdown, line_blocks], ensure_ascii=False, sort_keys=True) if line_blocks else markdown
+    digest = sha256(snapshot.encode("utf-8")).hexdigest()
+    changed = digest != source["last_digest"]
+    version = source["last_version_id"]
+    if changed:
+        revision = upload(db, source["library"], source["document_id"], source["title"], source["provider"] + ".md",
+                          markdown, source_url=source["source_url"], provider=source["provider"],
+                          line_blocks=line_blocks)
+        version = revision["version_id"]
+    db.execute("""
+        UPDATE managed_source SET last_digest=%s, last_version_id=%s, checked_at=statement_timestamp(),
+            last_error=NULL WHERE id=%s
+    """, (digest, version, source["id"]))
+    return {"changed": changed, "version_id": version, "document_id": source["document_id"]}
 
 
 def sync_source(db, identifier, fetch_feishu):
@@ -125,6 +144,8 @@ def sync_source(db, identifier, fetch_feishu):
         """, (identifier,)).fetchone()
         if not source:
             raise SourceError("找不到此在线来源。", 404)
+        if source["user_imported"]:
+            raise SourceError("此来源使用个人飞书授权，请通过 MCP 重新导入以更新。", 409)
         try:
             provider = source["provider"]
             if provider == "notion":
@@ -133,26 +154,13 @@ def sync_source(db, identifier, fetch_feishu):
                 markdown, line_blocks = fetch_feishu(source["source_url"], source["section_heading"])
             else:
                 raise SourceError("暂不支持此来源类型。", 422)
-            markdown = markdown.replace("\r\n", "\n")
-            snapshot = json.dumps([markdown, line_blocks], ensure_ascii=False, sort_keys=True) if line_blocks else markdown
-            digest = sha256(snapshot.encode("utf-8")).hexdigest()
-            changed = digest != source["last_digest"]
-            version = source["last_version_id"]
-            if changed:
-                revision = upload(db, source["library"], source["document_id"], source["title"], provider + ".md",
-                                  markdown, source_url=source["source_url"], provider=provider,
-                                  line_blocks=line_blocks)
-                version = revision["version_id"]
+            result = stage_source_snapshot(db, source, markdown, line_blocks)
         except ManagementError as error:
             cur.execute("UPDATE managed_source SET checked_at=statement_timestamp(), last_error=%s WHERE id=%s",
                         (str(error), identifier))
             failure = error if isinstance(error, SourceError) else SourceError(str(error), 422)
         else:
-            cur.execute("""
-                UPDATE managed_source SET last_digest=%s, last_version_id=%s, checked_at=statement_timestamp(),
-                    last_error=NULL WHERE id=%s
-            """, (digest, version, identifier))
             failure = None
     if failure:
         raise failure
-    return {"changed": changed, "version_id": version, "document_id": source["document_id"]}
+    return result

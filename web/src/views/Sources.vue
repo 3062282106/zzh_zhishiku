@@ -151,7 +151,8 @@ function openNew() {
                 <span v-else class="pill live">正常</span>
               </td>
               <td class="right" @click.stop>
-                <button class="btn sm" :disabled="busyId === row.id" @click="sync(row)">立即同步</button>
+                <span v-if="row.user_imported" class="muted">通过 Agent 更新</span>
+                <button v-else class="btn sm" :disabled="busyId === row.id" @click="sync(row)">立即同步</button>
               </td>
             </tr>
           </tbody>

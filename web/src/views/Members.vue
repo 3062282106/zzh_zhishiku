@@ -3,13 +3,16 @@ import { ref, computed, onMounted } from "vue";
 import PageHead from "../components/PageHead.vue";
 import EmptyState from "../components/EmptyState.vue";
 import Drawer from "../components/Drawer.vue";
-import { api, enc } from "../api";
+import { api, enc, knowledgeApi } from "../api";
+import { useRoute, useRouter } from "vue-router";
 import { auth, clearToken } from "../auth";
 import { store, loadMembers, loadSettings } from "../store";
 import { activeGrants, toLocalInput, iso } from "../format";
 import { toast, toastError, fail } from "../toast";
 import { confirmBox } from "../confirm";
 
+const route = useRoute();
+const router = useRouter();
 const q = ref("");
 const member = ref(null);
 const createOpen = ref(false);
@@ -17,12 +20,17 @@ const busy = ref(false);
 const chosen = ref([]);
 const expires = ref("");
 const webEmail = ref("");
+const personalUpload = ref(false);
 
-const emptyForm = () => ({ name: "", email: "", libraries: [], expires: "", admin: false, username: "", password: "" });
+const emptyForm = () => ({ name: "", email: "", libraries: [], expires: "", personalUpload: false, admin: false, username: "", password: "" });
 const form = ref(emptyForm());
 const administrators = ref([]);
 const managedAdmin = ref(null);
 const adminPassword = ref("");
+const adminImport = ref(null);
+const adminImportToken = ref("");
+const feishuAuthorized = ref(false);
+const ownAdmin = computed(() => managedAdmin.value?.id === auth.me?.id);
 const accounts = computed(() => [...store.members, ...administrators.value]);
 
 async function loadAdministrators() {
@@ -48,17 +56,31 @@ const active = computed(() => rows.value.filter((item) => item.enabled).length);
 
 onMounted(() => {
   loadMembers().catch(fail);
-  loadAdministrators().catch(fail);
+  loadAdministrators().then(() => {
+    const status = route.query.feishu;
+    if (!status && route.query.authorize !== "feishu") return;
+    const me = administrators.value.find((item) => item.id === auth.me?.id);
+    if (me) openMember(me);
+    if (status === "ok") toast("飞书已授权。可以回到 Agent 重新导入。");
+    else if (status) toastError(status === "mismatch" ? "飞书邮箱与后台企业邮箱不一致。" : "飞书授权未完成，请重试。");
+    const { feishu, authorize, ...query } = route.query;
+    router.replace({ query });
+  }).catch(fail);
   loadSettings().catch(() => {});
 });
 
 function openMember(item) {
   if (item.kind === "admin") {
     adminPassword.value = "";
+    adminImport.value = null;
+    adminImportToken.value = "";
+    feishuAuthorized.value = false;
     managedAdmin.value = item;
+    loadAdminImport(item).catch(fail);
     return;
   }
   member.value = item;
+  personalUpload.value = Boolean(item.personal_upload);
   webEmail.value = item.email || "";
   chosen.value = activeGrants(item).map((grant) => grant.library);
   const first = activeGrants(item)[0];
@@ -82,7 +104,7 @@ async function save() {
   busy.value = true;
   try {
     await api("/members/" + enc(member.value.id) + "/grants",
-      { method: "POST", body: { libraries: chosen.value, expires_at: iso(expires.value) } });
+      { method: "POST", body: { libraries: chosen.value, expires_at: iso(expires.value), personal_upload: personalUpload.value } });
     toast("已保存 " + member.value.name + " 的访问范围。");
     member.value = null;
     await loadMembers();
@@ -119,11 +141,48 @@ async function create() {
         email: form.value.email.trim(),
         libraries: form.value.libraries,
         expires_at: iso(form.value.expires),
+        personal_upload: form.value.personalUpload,
       },
     });
     createOpen.value = false;
     issued.value = created;
     await loadMembers();
+  } catch (error) {
+    fail(error);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function loadAdminImport(target) {
+  const access = await api("/administrators/" + enc(target.id) + "/import-access");
+  if (managedAdmin.value?.id !== target.id) return;
+  adminImport.value = access;
+  if (ownAdmin.value && access.libraries.length) {
+    const status = await knowledgeApi("/feishu/status");
+    if (managedAdmin.value?.id === target.id) feishuAuthorized.value = status.authorized;
+  }
+}
+
+async function adminImportAction(action) {
+  if (busy.value || !managedAdmin.value || !adminImport.value) return;
+  busy.value = true;
+  try {
+    if (action === "save") {
+      await api("/administrators/" + enc(managedAdmin.value.id) + "/import-access", {
+        method: "PUT", body: { email: adminImport.value.email, libraries: adminImport.value.libraries },
+      });
+      await loadAdminImport(managedAdmin.value);
+      await loadAdministrators();
+      toast("已保存飞书导入权限。");
+    } else if (action === "authorize") {
+      const authorization = await knowledgeApi("/feishu/authorize", { method: "POST" });
+      window.location.assign(authorization.url);
+    } else {
+      const result = await api("/import-token", { method: "POST" });
+      adminImportToken.value = result.token;
+      adminImport.value.has_token = true;
+    }
   } catch (error) {
     fail(error);
   } finally {
@@ -250,7 +309,7 @@ function guideText(person, token) {
     "连上之后可以直接问，例如：",
     "    用 knowledge 查：<你的问题>，附上原文",
     "",
-    "可用工具：search_knowledge（查内容）、get_knowledge_reference（取原文片段）",
+    "如已开通个人库上传权限，可发送飞书链接并请 Agent 加到个人知识库。",
   ].join("\n");
 }
 
@@ -364,6 +423,10 @@ async function copy(text, label) {
     </div>
 
     <div class="field">
+      <div class="checks"><label><input v-model="personalUpload" type="checkbox">允许通过 Agent 导入到个人知识库</label></div>
+    </div>
+
+    <div class="field">
       <label>网页登录 · {{ WEB_STATUS[member.web_status] || '未开通' }}</label>
       <input v-if="!member.email" v-model="webEmail" type="email" placeholder="成员邮箱" aria-label="用于网页登录的邮箱" maxlength="200">
       <div v-if="member.enabled" class="rowacts" style="justify-content:flex-start">
@@ -423,6 +486,9 @@ async function copy(text, label) {
       <label>访问到期时间（留空表示长期）</label>
       <input v-model="form.expires" type="datetime-local">
     </div>
+    <div class="field">
+      <div class="checks"><label><input v-model="form.personalUpload" type="checkbox">允许通过 Agent 导入到个人知识库</label></div>
+    </div>
     </template>
     <template #footer>
       <button class="btn" @click="createOpen = false">取消</button>
@@ -431,6 +497,39 @@ async function copy(text, label) {
   </Drawer>
 
   <Drawer v-if="managedAdmin" title="管理管理员" :subtitle="managedAdmin.name" @close="managedAdmin = null">
+    <template v-if="adminImport">
+      <div class="field">
+        <label for="admin-import-email">企业邮箱</label>
+        <input id="admin-import-email" v-model.trim="adminImport.email" type="email" maxlength="200">
+      </div>
+      <div class="field">
+        <label>可通过 Agent 导入的企业知识库</label>
+        <div class="checks">
+          <label v-for="lib in store.libraries" :key="lib.id">
+            <input v-model="adminImport.libraries" type="checkbox" :value="lib.id">{{ lib.name }}
+          </label>
+        </div>
+      </div>
+      <div class="rowacts" style="justify-content:flex-start">
+        <button class="btn sm primary" :disabled="busy" @click="adminImportAction('save')">保存导入权限</button>
+        <button v-if="ownAdmin && adminImport.libraries.length" class="btn sm" :disabled="busy" @click="adminImportAction('authorize')">
+          {{ feishuAuthorized ? '重新授权飞书' : '授权飞书' }}
+        </button>
+        <button v-if="ownAdmin && adminImport.libraries.length" class="btn sm" :disabled="busy" @click="confirmBox({
+          title: adminImport.has_token ? '更换专用导入令牌？' : '生成专用导入令牌？',
+          note: adminImport.has_token ? '原导入令牌立即失效。' : '该令牌允许 Agent 向你获授权的企业库提交飞书草稿。',
+          label: '生成', action: () => adminImportAction('token'),
+        })">{{ adminImport.has_token ? '更换导入令牌' : '生成导入令牌' }}</button>
+      </div>
+      <div v-if="adminImportToken" class="field">
+        <label>专用导入令牌</label>
+        <div class="secret">
+          <code>{{ adminImportToken }}</code>
+          <button class="btn sm" @click="copy(adminImportToken, '导入令牌')">复制</button>
+          <p class="muted">在 MCP 连接器中使用此令牌，可以提交企业库导入草稿。</p>
+        </div>
+      </div>
+    </template>
     <div class="field"><label for="reset-admin-password">新密码（至少 10 位）</label><input id="reset-admin-password" v-model="adminPassword" type="password" maxlength="200" autocomplete="new-password"></div>
     <template #footer>
       <button class="btn" :disabled="busy || managedAdmin.id === auth.me?.id" @click="updateAdministrator('state')">{{ managedAdmin.enabled ? '停用' : '启用' }}</button>

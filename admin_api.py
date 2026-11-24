@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, StringConstraints
@@ -98,6 +98,30 @@ def member_file_digest(db, token):
         raise HTTPException(401, "登录已过期，请重新登录。") from None
 
 
+def enterprise_scope(request: Request):
+    """The operator console manages shared content only."""
+    params = request.path_params
+    if "library" in params:
+        query, key = "SELECT id FROM knowledge_base WHERE id=%s AND owner_member_id IS NOT NULL", params["library"]
+    elif "document" in params:
+        query, key = """
+            SELECT 1 FROM source_document d JOIN knowledge_base k ON k.id=d.kb_id
+            WHERE d.platform='upload' AND d.document_id=%s AND k.owner_member_id IS NOT NULL
+        """, params["document"]
+    elif "identifier" in params:
+        table = "managed_source" if request.url.path.startswith("/v1/admin/sources/") else "managed_file"
+        try:
+            key = UUID(params["identifier"])
+        except ValueError:
+            return
+        query = f"SELECT 1 FROM {table} d JOIN knowledge_base k ON k.id=d.library WHERE d.id=%s AND k.owner_member_id IS NOT NULL"
+    else:
+        return
+    with connect() as db:
+        if db.execute(query, (key,)).fetchone():
+            raise HTTPException(404, "找不到企业知识库中的对应内容。")
+
+
 class LibraryRequest(BaseModel):
     name: Title
 
@@ -154,6 +178,7 @@ class GrantRequest(BaseModel):
 class MemberGrantRequest(BaseModel):
     libraries: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]]
     expires_at: datetime | None = None
+    personal_upload: bool | None = None
 
 
 class MemberCreate(BaseModel):
@@ -162,6 +187,7 @@ class MemberCreate(BaseModel):
     libraries: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)]] = []
     expires_at: datetime | None = None
     kind: Annotated[str, StringConstraints(strip_whitespace=True, max_length=20)] = "employee"
+    personal_upload: bool = False
 
 
 class MemberState(BaseModel):
@@ -188,7 +214,7 @@ class FeishuSourceRequest(NotionSourceRequest):
 
 def router(hybrid):
     routes = APIRouter()
-    control = APIRouter(prefix="/v1/admin", dependencies=[Depends(admin_identity)])
+    control = APIRouter(prefix="/v1/admin", dependencies=[Depends(admin_identity), Depends(enterprise_scope)])
 
     @routes.get("/admin", include_in_schema=False)
     def console_redirect():
@@ -228,6 +254,11 @@ def router(hybrid):
             migrate(db)
             try:
                 if "@" in payload.username:
+                    if not payload.setup_code:
+                        try:
+                            return {**open_session(db, payload.username, payload.password), "role": "admin"}
+                        except ManagementError:
+                            pass
                     return open_member_web_session(db, payload.username, payload.password, payload.setup_code)
                 return {**open_session(db, payload.username, payload.password), "role": "admin"}
             except WebLoginError as error:
@@ -332,7 +363,7 @@ def router(hybrid):
         with connect() as db:
             migrate(db)
             key = uuid4().hex
-            db.execute("INSERT INTO knowledge_base VALUES (%s, %s)", (key, payload.name))
+            db.execute("INSERT INTO knowledge_base (id, name) VALUES (%s, %s)", (key, payload.name))
         return {"id": key, "name": payload.name}
 
     @control.get("/members")
@@ -350,7 +381,7 @@ def router(hybrid):
             with connect() as db:
                 migrate(db)
                 return create_member(db, payload.name, payload.email, payload.libraries,
-                                     payload.expires_at, payload.kind, enable_web=True)
+                                     payload.expires_at, payload.kind, enable_web=True, personal_upload=payload.personal_upload)
         except ManagementError as error:
             raise HTTPException(422, str(error)) from None
 
@@ -408,7 +439,7 @@ def router(hybrid):
         try:
             with connect() as db:
                 migrate(db)
-                return set_member_grants(db, member, payload.libraries, payload.expires_at)
+                return set_member_grants(db, member, payload.libraries, payload.expires_at, payload.personal_upload)
         except ManagementError as error:
             raise HTTPException(422, str(error)) from None
 

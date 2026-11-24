@@ -1,4 +1,4 @@
-"""Read a selected Feishu Docx section using an approved app identity."""
+"""Read whole Feishu Docx documents or selected sections."""
 import json
 import os
 import re
@@ -34,13 +34,13 @@ def bind_feishu(db, library, link, title, heading):
     return bind_source(db, library, "feishu", kind + ":" + token, canonical, title, heading)
 
 
-def call(path, token=None, body=None):
+def call(path, token=None, body=None, *, origin=API):
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
     if body is not None:
         headers["Content-Type"] = "application/json"
-    request = Request(API + path, json.dumps(body).encode() if body is not None else None, headers)
+    request = Request(origin + path, json.dumps(body).encode() if body is not None else None, headers)
     try:
         with OPENER.open(request, timeout=18) as response:
             raw = response.read(MAX_RESPONSE + 1)
@@ -49,7 +49,7 @@ def call(path, token=None, body=None):
         payload = json.loads(raw)
     except HTTPError as error:
         if error.code in (401, 403, 404):
-            raise SourceError("飞书应用读不到此文档，请检查应用权限和文档授权。", 409) from None
+            raise SourceError("飞书拒绝访问，请检查当前飞书账号的文档权限或应用授权。", 409) from None
         raise SourceError(f"飞书请求失败（HTTP {error.code}），本次没有同步。") from None
     except (URLError, TimeoutError, UnicodeError, json.JSONDecodeError):
         raise SourceError("暂时无法读取飞书，请稍后重试。", 503) from None
@@ -137,13 +137,15 @@ def render_section(blocks, root, selected):
         top = [blocks[key] for key in child_ids(blocks[root])]
     except KeyError:
         raise SourceError("飞书结果缺少部分文档块。") from None
-    matches = [(index, name[0]) for index, block in enumerate(top)
-               if (name := heading(block)) and name[1] == selected]
-    if len(matches) != 1:
-        raise SourceError("找不到唯一匹配的顶层标题，请复制完整章节标题。", 422)
-    start, level = matches[0]
-    end = next((index for index in range(start + 1, len(top))
-                if (name := heading(top[index])) and name[0] <= level), len(top))
+    start, end = 0, len(top)
+    if selected is not None:
+        matches = [(index, name[0]) for index, block in enumerate(top)
+                   if (name := heading(block)) and name[1] == selected]
+        if len(matches) != 1:
+            raise SourceError("找不到唯一匹配的顶层标题，请复制完整章节标题。", 422)
+        start, level = matches[0]
+        end = next((index for index in range(start + 1, len(top))
+                    if (name := heading(top[index])) and name[0] <= level), len(top))
 
     lines, line_blocks = [], {}
     visiting = set()
@@ -207,12 +209,19 @@ def render_section(blocks, root, selected):
     return "\n".join(lines), line_blocks
 
 
-def fetch_feishu_section(link, selected):
+def fetch_feishu_document(link, selected, access_token):
     kind, token, _ = parse_link(link)
-    access_token = credential()
     document_id = get_document_id(kind, token, access_token)
     document = call(f"/docx/v1/documents/{document_id}", access_token).get("data", {}).get("document", {})
     revision = document.get("revision_id")
     if type(revision) is not int or revision < 1:
         raise SourceError("飞书没有返回可校验的文档版本。")
-    return render_section(list_blocks(document_id, revision, access_token), document_id, selected)
+    markdown, line_blocks = render_section(list_blocks(document_id, revision, access_token), document_id, selected)
+    title = document.get("title")
+    title = title.strip()[:160] if isinstance(title, str) else ""
+    return document_id, title or "飞书云文档", markdown, line_blocks
+
+
+def fetch_feishu_section(link, selected):
+    _, _, markdown, line_blocks = fetch_feishu_document(link, selected, credential())
+    return markdown, line_blocks

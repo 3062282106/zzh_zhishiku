@@ -1,6 +1,7 @@
 """Local HTTP entry point for the enterprise knowledge base."""
 
 import argparse
+from contextlib import asynccontextmanager
 import logging
 import os
 from pathlib import Path
@@ -26,14 +27,24 @@ from access import QueryTrace, authorized_hybrid_query, authorized_query, author
 from metadata import normalize
 
 
-app = FastAPI(title="企业知识库", version="0.1.0")
+from admin import migrate
+from admin_api import router as admin_router
+from import_api import router as import_router
+
+
+@asynccontextmanager
+async def lifespan(app):
+    with connect() as db:
+        migrate(db)
+    yield
+
+
+app = FastAPI(title="企业知识库", version="0.1.0", lifespan=lifespan)
 bearer = HTTPBearer(auto_error=False)
 log = logging.getLogger(__name__)
 HYBRID_ENABLED = os.environ.get("KB_ENABLE_HYBRID") == "1"
-
-from admin import migrate
-from admin_api import router as admin_router
 app.include_router(admin_router(HYBRID_ENABLED))
+app.include_router(import_router(HYBRID_ENABLED))
 
 
 class SearchRequest(BaseModel):

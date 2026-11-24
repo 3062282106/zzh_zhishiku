@@ -49,6 +49,14 @@ server {
     limit_req_status 429;
 
     access_log /var/log/nginx/kb-admin.log;
+    # OAuth codes and state appear in the callback query string.
+    location = /v1/knowledge/feishu/callback {
+        access_log off;
+        proxy_pass http://127.0.0.1:18081;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
 
     # 直接敲域名的人应该落在控制台，而不是 API 的根路径。
     location = / { return 302 /admin/; }

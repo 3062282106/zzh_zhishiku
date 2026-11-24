@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS member_account (
     token_hash text UNIQUE NOT NULL,
     enabled boolean NOT NULL DEFAULT true
 );
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS owner_member_id text REFERENCES member_account(id);
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_base_one_personal_per_member
+    ON knowledge_base(owner_member_id) WHERE owner_member_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS knowledge_grant (
     member_id text NOT NULL REFERENCES member_account(id),
     kb_id text NOT NULL REFERENCES knowledge_base(id),

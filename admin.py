@@ -128,7 +128,7 @@ def bootstrap_admin(db):
 def admin_directory(db):
     with db.cursor(row_factory=dict_row) as cur:
         return cur.execute("""
-            SELECT id, username, display_name, enabled, created_at, last_login_at
+            SELECT id, username, display_name, email, enabled, created_at, last_login_at
             FROM admin_account ORDER BY created_at
         """).fetchall()
 
@@ -173,9 +173,12 @@ def set_admin_state(db, admin, enabled):
 
 def open_session(db, username, password, hours=24):
     with db.transaction():
-        row = db.execute("SELECT id, username, display_name, enabled, password_hash "
-                         "FROM admin_account WHERE lower(username)=lower(%s)",
-                         ((username or "").strip(),)).fetchone()
+        identity = (username or "").strip().lower()
+        row = db.execute("""
+            SELECT id, username, display_name, enabled, password_hash FROM admin_account
+            WHERE lower(username)=%s OR lower(email)=%s
+            ORDER BY (lower(username)=%s) DESC LIMIT 1
+        """, (identity, identity, identity)).fetchone()
         if not row or not row[3] or not verify_password(password, row[4]):
             raise ManagementError("用户名或密码不对。")
         token = token_urlsafe(32)
@@ -260,7 +263,7 @@ def set_access_contact_url(db, url):
 
 
 def libraries(db):
-    return db.execute("SELECT id, name FROM knowledge_base ORDER BY name").fetchall()
+    return db.execute("SELECT id, name FROM knowledge_base WHERE owner_member_id IS NULL ORDER BY name").fetchall()
 
 
 def documents(db, library):
@@ -492,30 +495,30 @@ def member_directory(db):
     with db.cursor(row_factory=dict_row) as cur:
         return cur.execute("""
             SELECT m.id, COALESCE(m.display_name, m.id) AS name, m.email,
-                   COALESCE(m.kind, 'employee') AS kind, m.enabled,
+                   COALESCE(m.kind, 'employee') AS kind, m.enabled, m.personal_upload,
                    CASE WHEN w.member_id IS NULL THEN 'not_enabled'
                         WHEN w.password_hash IS NOT NULL THEN 'active'
                         WHEN w.setup_expires_at <= now() THEN 'expired' ELSE 'pending' END AS web_status,
                    COALESCE(json_agg(json_build_object(
                        'library', g.kb_id, 'name', kb.name,
                        'expires_at', g.expires_at, 'revoked_at', g.revoked_at
-                   ) ORDER BY kb.name) FILTER (WHERE g.kb_id IS NOT NULL), '[]'::json) AS grants
+                   ) ORDER BY kb.name) FILTER (WHERE kb.id IS NOT NULL), '[]'::json) AS grants
             FROM member_account m
             LEFT JOIN knowledge_grant g ON g.member_id = m.id
-            LEFT JOIN knowledge_base kb ON kb.id = g.kb_id
+            LEFT JOIN knowledge_base kb ON kb.id = g.kb_id AND kb.owner_member_id IS NULL
             LEFT JOIN member_web_credential w ON w.member_id=m.id
             GROUP BY m.id, w.member_id, w.password_hash, w.setup_expires_at
             ORDER BY name
         """).fetchall()
 
 
-def set_member_grants(db, member, libraries, expires_at=None):
+def set_member_grants(db, member, libraries, expires_at=None, personal_upload=None):
     if expires_at is not None and expires_at.utcoffset() is None:
         raise ManagementError("到期时间需要包含时区。")
     with db.transaction():
-        if not db.execute("SELECT 1 FROM member_account WHERE id=%s AND enabled", (member,)).fetchone():
+        if not db.execute("SELECT 1 FROM member_account WHERE id=%s AND enabled FOR UPDATE", (member,)).fetchone():
             raise ManagementError("找不到已启用的成员。")
-        known = {row[0] for row in db.execute("SELECT id FROM knowledge_base").fetchall()}
+        known = {key for key, _ in db.execute("SELECT id, name FROM knowledge_base WHERE owner_member_id IS NULL")}
         unknown = [name for name in libraries if name not in known]
         if unknown:
             raise ManagementError("找不到知识库：" + "、".join(unknown))
@@ -523,6 +526,10 @@ def set_member_grants(db, member, libraries, expires_at=None):
             UPDATE knowledge_grant SET revoked_at=now(), updated_at=now()
             WHERE member_id=%s AND revoked_at IS NULL AND NOT (kb_id = ANY(%s))
         """, (member, libraries))
+        if personal_upload is not None and db.execute("""
+            UPDATE member_account SET personal_upload=%s WHERE id=%s AND personal_upload IS DISTINCT FROM %s
+        """, (personal_upload, member, personal_upload)).rowcount:
+            member_event(db, member, "personal_upload_enabled" if personal_upload else "personal_upload_revoked")
         for library in libraries:
             db.execute("""
                 INSERT INTO knowledge_grant (member_id, kb_id, expires_at, revoked_at, updated_at)
@@ -535,7 +542,8 @@ def set_member_grants(db, member, libraries, expires_at=None):
 
 MEMBER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 MEMBER_EVENTS = {"created": "新建成员", "disabled": "停用成员", "enabled": "启用成员", "token_reset": "重置令牌",
-                 "web_opened": "开通网页登录", "web_password_reset": "重置网页密码"}
+                 "web_opened": "开通网页登录", "web_password_reset": "重置网页密码",
+                 "personal_upload_enabled": "开通个人库上传", "personal_upload_revoked": "撤销个人库上传"}
 
 
 def member_event(db, member, action, detail=None):
@@ -577,7 +585,7 @@ def issue_member_web_setup(db, member, email=None):
     return {"email": email, "setup_code": code, "expires_at": expires_at}
 
 
-def create_member(db, name, email=None, libraries=(), expires_at=None, kind="employee", *, enable_web=False):
+def create_member(db, name, email=None, libraries=(), expires_at=None, kind="employee", *, enable_web=False, personal_upload=False):
     """Create an account and return its token once.
 
     Only the hash is stored, so the plaintext token exists exactly once — in this
@@ -600,8 +608,8 @@ def create_member(db, name, email=None, libraries=(), expires_at=None, kind="emp
             VALUES (%s,%s,true,%s,%s,%s)
         """, (member, token_hash(token), name, email, kind))
         member_event(db, member, "created", name + (f" <{email}>" if email else ""))
-        if libraries:
-            set_member_grants(db, member, list(libraries), expires_at)
+        if libraries or personal_upload:
+            set_member_grants(db, member, list(libraries), expires_at, personal_upload)
         web_setup = issue_member_web_setup(db, member) if email and enable_web else None
     return {"id": member, "name": name, "email": email, "kind": kind, "token": token,
             "libraries": list(libraries), "web_setup": web_setup}
@@ -660,7 +668,7 @@ def task_feed(db, library=None, days=30):
                    GREATEST(0, EXTRACT(EPOCH FROM (statement_timestamp() - f.created_at))::int)
                      AS waiting_seconds
             FROM managed_file f JOIN knowledge_base kb ON kb.id = f.library
-            WHERE f.created_at > statement_timestamp() - make_interval(days => %s)""" + scope + """
+            WHERE kb.owner_member_id IS NULL AND f.created_at > statement_timestamp() - make_interval(days => %s)""" + scope + """
             ORDER BY COALESCE(f.publication_requested_at, f.created_at) DESC LIMIT 200
         """, [days, *parameters]).fetchall()
         source_scope, source_parameters = "", []
@@ -670,7 +678,7 @@ def task_feed(db, library=None, days=30):
             SELECT s.id, s.document_id, s.library, kb.name AS library_name, s.title, s.provider,
                    s.checked_at, s.last_error
             FROM managed_source s JOIN knowledge_base kb ON kb.id = s.library
-            WHERE s.checked_at > statement_timestamp() - make_interval(days => %s)""" + source_scope + """
+            WHERE kb.owner_member_id IS NULL AND s.checked_at > statement_timestamp() - make_interval(days => %s)""" + source_scope + """
             ORDER BY s.checked_at DESC LIMIT 100
         """, [days, *source_parameters]).fetchall()
 
@@ -725,9 +733,9 @@ def retrieval_feed(db, *, days, member, library, status, before, limit):
             SELECT e.id, e.recorded_at, e.member_id, COALESCE(m.display_name, e.member_id) AS member_name,
                    e.status, e.channel, e.evidence_count, e.duration_ms, e.stages_ms,
                    ARRAY(SELECT COALESCE(k.name, ids.id) FROM unnest(e.searched_library_ids) AS ids(id)
-                         LEFT JOIN knowledge_base k USING (id) ORDER BY COALESCE(k.name, ids.id)) AS searched_libraries,
+                         LEFT JOIN knowledge_base k USING (id) WHERE k.owner_member_id IS NULL ORDER BY COALESCE(k.name, ids.id)) AS searched_libraries,
                    ARRAY(SELECT COALESCE(k.name, ids.id) FROM unnest(e.evidence_library_ids) AS ids(id)
-                         LEFT JOIN knowledge_base k USING (id) ORDER BY COALESCE(k.name, ids.id)) AS evidence_libraries
+                         LEFT JOIN knowledge_base k USING (id) WHERE k.owner_member_id IS NULL ORDER BY COALESCE(k.name, ids.id)) AS evidence_libraries
             FROM retrieval_event e LEFT JOIN member_account m ON m.id=e.member_id
             WHERE """ + " AND ".join(conditions) + " ORDER BY e.id DESC LIMIT %s", (*parameters, limit + 1)).fetchall()
     return {"items": rows[:limit], "next_before": rows[limit - 1]["id"] if len(rows) > limit else None}
@@ -746,7 +754,7 @@ def audit_feed(db, library=None, kind=None, limit=200):
                 FROM managed_publish_event e
                 JOIN managed_version mv ON mv.id = e.version_id
                 JOIN source_document d ON d.platform='upload' AND d.document_id = e.document_id
-                JOIN knowledge_base kb ON kb.id = d.kb_id
+                JOIN knowledge_base kb ON kb.id = d.kb_id AND kb.owner_member_id IS NULL
                 UNION ALL
                 SELECT 'availability',
                        a.created_at,
@@ -757,12 +765,12 @@ def audit_feed(db, library=None, kind=None, limit=200):
                 FROM managed_availability_event a
                 JOIN managed_version mv ON mv.id = a.version_id
                 JOIN source_document d ON d.platform='upload' AND d.document_id = a.document_id
-                JOIN knowledge_base kb ON kb.id = d.kb_id
+                JOIN knowledge_base kb ON kb.id = d.kb_id AND kb.owner_member_id IS NULL
                 UNION ALL
                 SELECT 'grant', g.updated_at, CASE WHEN g.revoked_at IS NULL THEN 'grant' ELSE 'revoke' END,
                        g.kb_id, kb.name, COALESCE(m.display_name, m.id), NULL, NULL, m.id
                 FROM knowledge_grant g
-                JOIN knowledge_base kb ON kb.id = g.kb_id
+                JOIN knowledge_base kb ON kb.id = g.kb_id AND kb.owner_member_id IS NULL
                 JOIN member_account m ON m.id = g.member_id
                 UNION ALL
                 -- Account lifecycle: creating, disabling and rotating a token leave no

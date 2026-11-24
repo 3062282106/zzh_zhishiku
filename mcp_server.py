@@ -1,4 +1,4 @@
-"""Read-only local MCP adapter for the enterprise knowledge HTTP service."""
+"""Local MCP adapter for the enterprise knowledge HTTP service."""
 
 import argparse
 import json
@@ -42,6 +42,13 @@ def request(path, token, body=None):
         with OPENER.open(Request(BASE_URL + path, data=data, headers=headers), timeout=50) as response:
             return json.load(response)
     except HTTPError as error:
+        if path == "/v1/knowledge/imports/feishu":
+            try:
+                detail = json.load(error).get("detail")
+            except (OSError, ValueError):
+                detail = None
+            if isinstance(detail, str):
+                raise ToolError(detail) from None
         if error.code == 401:
             raise ToolError("本地知识库身份无效。") from None
         if error.code == 404:
@@ -79,6 +86,20 @@ def create_server(get_token):
     ) -> CallToolResult:
         """通过搜索结果里的 chunk_id 重新读取证据。每次调用都检查当前权限。"""
         return tool_result(request(f"/v1/knowledge/references/{chunk_id}", get_token()))
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                                             idempotent_hint=True, open_world_hint=True))
+    def import_feishu_document(
+        url: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)],
+        library: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
+        section_heading: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
+    ) -> CallToolResult:
+        """仅在用户明确要求入库时使用。把用户指定的飞书云文档链接导入为草稿，不会自动发布。
+        普通成员留空 library 或填写「个人知识库」。有授权的管理员必须明确指定企业库名称或 ID。
+        未提供章节时读取整篇。authorization_required 时请把网页授权链接交给用户，授权后重试。"""
+        return tool_result(request("/v1/knowledge/imports/feishu", get_token(), {
+            "url": url, "library": library, "section_heading": section_heading,
+        }))
 
     return server
 

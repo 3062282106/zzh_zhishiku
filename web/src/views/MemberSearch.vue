@@ -1,12 +1,17 @@
 <script setup>
-import { ref } from "vue";
+import { computed, ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { auth } from "../auth";
 import { enc, knowledgeApi } from "../api";
 import { chunkWhere } from "../format";
 import Drawer from "../components/Drawer.vue";
+import PersonalLibrary from "./PersonalLibrary.vue";
 
 defineEmits(["logout"]);
 
+const route = useRoute();
+const router = useRouter();
+const showPersonal = computed(() => Boolean(route.query.personal || route.query.document || route.query.feishu));
 const question = ref("");
 const result = ref(null);
 const error = ref("");
@@ -75,23 +80,30 @@ async function downloadSource(item) {
       <div class="member-account"><span>{{ auth.me.name }}</span><button class="btn link" @click="$emit('logout')">退出登录</button></div>
     </header>
     <main>
-      <h1>查询知识库</h1>
-      <form class="search-box" @submit.prevent="search">
-        <input v-model="question" type="search" placeholder="输入要查询的问题" maxlength="1024" required aria-label="查询问题">
-        <button class="btn primary" :disabled="busy || !question.trim()">{{ busy ? "查询中…" : "查询" }}</button>
-      </form>
-      <p v-if="error" class="member-error" role="alert">{{ error }}</p>
-      <div v-if="result?.evidence.length" class="results">
-        <h2>相关资料</h2>
-        <article v-for="item in result.evidence" :key="item.chunk_id" class="card result-item">
-          <h3>{{ item.title }}</h3>
-          <p v-if="item.heading_path.length" class="muted">{{ item.heading_path.join(" / ") }}</p>
-          <p v-if="item.locator.position_unit === 'csv_line'" class="muted">{{ chunkWhere(item, 0) }}</p>
-          <p class="snippet">{{ item.snippet }}</p>
-          <button class="btn link" :disabled="opening" @click="openReference(item)">查看引用</button>
-        </article>
-      </div>
-      <p v-else-if="result" class="note" role="status">没有找到相关资料。</p>
+      <nav class="member-nav" aria-label="知识库视图">
+        <button class="btn" :class="{ primary: !showPersonal }" :aria-pressed="!showPersonal" @click="router.replace({ query: {} })">查询知识库</button>
+        <button class="btn" :class="{ primary: showPersonal }" :aria-pressed="showPersonal" @click="router.replace({ query: { personal: '1' } })">个人知识库</button>
+      </nav>
+      <PersonalLibrary v-if="showPersonal" />
+      <template v-else>
+        <h1>查询知识库</h1>
+        <form class="search-box" @submit.prevent="search">
+          <input v-model="question" type="search" placeholder="输入要查询的问题" maxlength="1024" required aria-label="查询问题">
+          <button class="btn primary" :disabled="busy || !question.trim()">{{ busy ? "查询中…" : "查询" }}</button>
+        </form>
+        <p v-if="error" class="member-error" role="alert">{{ error }}</p>
+        <div v-if="result?.evidence.length" class="results">
+          <h2>相关资料</h2>
+          <article v-for="item in result.evidence" :key="item.chunk_id" class="card result-item">
+            <h3>{{ item.title }}</h3>
+            <p v-if="item.heading_path.length" class="muted">{{ item.heading_path.join(" / ") }}</p>
+            <p v-if="item.locator.position_unit === 'csv_line'" class="muted">{{ chunkWhere(item, 0) }}</p>
+            <p class="snippet">{{ item.snippet }}</p>
+            <button class="btn link" :disabled="opening" @click="openReference(item)">查看引用</button>
+          </article>
+        </div>
+        <p v-else-if="result" class="note" role="status">没有找到相关资料。</p>
+      </template>
     </main>
   </div>
 
@@ -111,6 +123,7 @@ async function downloadSource(item) {
 .member-account { color: var(--muted); font-size: 13px; }
 main { width: min(760px, calc(100% - 32px)); margin: 56px auto; }
 h1 { margin-bottom: 16px; font-size: 26px; }
+.member-nav { display: flex; gap: 8px; margin-bottom: 20px; }
 .search-box { margin-bottom: 24px; }
 .search-box input { flex: 1; min-width: 0; height: 42px; }
 .search-box button { height: 42px; }

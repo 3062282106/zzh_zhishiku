@@ -11,8 +11,8 @@ import tarfile
 
 
 REQUIRED = {
-    "access.py", "admin.py", "admin_api.py", "admin_schema.sql", "api.py", "docling_parser.py", "feishu_source.py",
-    "file_ingest.py", "mcp_server.py", "notion_source.py", "search.py", "schema.sql",
+    "access.py", "admin.py", "admin_api.py", "admin_schema.sql", "agent_import.py", "api.py", "docling_parser.py", "feishu_source.py",
+    "file_ingest.py", "import_api.py", "mcp_server.py", "notion_source.py", "search.py", "schema.sql",
     "scripts/deploy-admin.sh", "scripts/verify-admin-cloud.py", "scripts/configure-notion.sh",
     "scripts/configure-mcp-entry.sh", "scripts/configure-admin-entry.sh",
 }
