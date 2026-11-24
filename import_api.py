@@ -75,7 +75,8 @@ def router(hybrid):
         response.headers["Cache-Control"] = "no-store"
         try:
             with connect() as db:
-                return stage_feishu_import(db, token, payload.url, payload.library, payload.section_heading)
+                return stage_feishu_import(db, token, payload.url, payload.library, payload.section_heading,
+                                           hybrid=hybrid)
         except SourceError as error:
             raise translate(error) from None
 

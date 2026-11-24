@@ -107,7 +107,7 @@ async function publish() {
     <p v-if="error && !selected" class="personal-error" role="alert">{{ error }}</p>
     <p v-if="pending" class="muted">正在加载…</p>
     <p v-else-if="!files.length" class="note">
-      {{ status?.upload_enabled ? "在已连接知识库的 Agent 里发送飞书链接，即可生成草稿。" : "联系管理员开通个人库上传权限。" }}
+      {{ status?.upload_enabled ? "在已连接知识库的 Agent 里发送飞书链接。导入完成后即可检索。" : "联系管理员开通个人库上传权限。" }}
     </p>
     <div v-else class="card">
       <table>

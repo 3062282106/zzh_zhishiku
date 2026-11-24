@@ -15,7 +15,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 from access import ADMIN_MCP_PREFIX, is_admin_mcp_token, member_web_identity, token_hash
-from admin import ManagementError, normalize_member_email, resolve_session
+from admin import ManagementError, activate, normalize_member_email, resolve_session
 from feishu_source import call, fetch_feishu_document, parse_link
 from notion_source import SourceError, bind_source, stage_source_snapshot
 
@@ -289,7 +289,28 @@ def target_library(db, actor, target):
     raise SourceError("请明确指定一个已授予你上传权限的企业知识库。", 403)
 
 
-def stage_feishu_import(db, token, url, target=None, heading=None):
+def publish_personal_import(db, token, actor, source_id, document, version, hybrid):
+    with db.transaction():
+        if import_identity(db, token, lock=True) != actor:
+            raise SourceError("上传权限已变更，请重试。", 403)
+        current, published, latest = db.execute("""
+            SELECT d.current_version, d.published, s.last_version_id
+            FROM managed_source s JOIN source_document d
+              ON d.platform=s.document_platform AND d.document_id=s.document_id
+            WHERE s.id=%s FOR UPDATE OF d
+        """, (source_id,)).fetchone()
+        if current == str(version) and published:
+            return "published", current, None
+        if latest != version:
+            return "superseded", current, "有更新的导入版本，请查看个人知识库。"
+        try:
+            activate(db, document, version, current, hybrid)
+        except ManagementError as error:
+            return "publication_failed", current, str(error)
+    return "published", str(version), None
+
+
+def stage_feishu_import(db, token, url, target=None, heading=None, *, hybrid=False):
     actor = import_identity(db, token)
     library, name = target_library(db, actor, target)
     kind, external, url = parse_link(url)
@@ -331,8 +352,15 @@ def stage_feishu_import(db, token, url, target=None, heading=None):
     document, version = result["document_id"], result["version_id"]
     review = (f"/admin/query?document={document}&version={version}" if actor.role == "member"
               else f"/admin/kb/{library}/doc/{document}?v={version}")
-    live, = db.execute("SELECT current_version FROM source_document WHERE platform='upload' AND document_id=%s",
-                      (document,)).fetchone()
-    status = "draft_created" if result["changed"] else "unchanged"
-    return {**result, "status": status, "published_version": live or None, "title": title, "library": name,
-            "review_url": origin + review, "source_url": url}
+    if actor.role == "member":
+        status, live, publication_error = publish_personal_import(db, token, actor, source["id"], document, version, hybrid)
+    else:
+        live, = db.execute("SELECT current_version FROM source_document WHERE platform='upload' AND document_id=%s",
+                          (document,)).fetchone()
+        status = "draft_created" if result["changed"] else "unchanged"
+        publication_error = None
+    outcome = {**result, "status": status, "published_version": live or None, "title": title, "library": name,
+               "review_url": origin + review, "source_url": url}
+    if publication_error:
+        outcome["message"] = publication_error
+    return outcome

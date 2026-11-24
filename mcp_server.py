@@ -94,9 +94,10 @@ def create_server(get_token):
         library: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
         section_heading: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = None,
     ) -> CallToolResult:
-        """仅在用户明确要求入库时使用。把用户指定的飞书云文档链接导入为草稿，不会自动发布。
+        """仅在用户明确要求入库时使用。个人知识库导入后自动发布，企业知识库导入为草稿。
         普通成员留空 library 或填写「个人知识库」。有授权的管理员必须明确指定企业库名称或 ID。
-        未提供章节时读取整篇。authorization_required 时请把网页授权链接交给用户，授权后重试。"""
+        未提供章节时读取整篇。authorization_required 时请把网页授权链接交给用户，授权后重试。
+        published 表示已可检索。publication_failed 表示个人文档已导入但索引未完成，可重新导入重试。"""
         return tool_result(request("/v1/knowledge/imports/feishu", get_token(), {
             "url": url, "library": library, "section_heading": section_heading,
         }))
