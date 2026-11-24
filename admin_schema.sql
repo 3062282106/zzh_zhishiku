@@ -47,6 +47,11 @@ ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS sync_pending_version uuid;
 ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS feishu_doc_token text;
 ALTER TABLE managed_source ADD COLUMN IF NOT EXISTS feishu_revision bigint;
 CREATE INDEX IF NOT EXISTS managed_feishu_sync_due ON managed_source(sync_next_at, id) WHERE provider='feishu';
+UPDATE managed_source SET last_error='飞书授权已失效，请在知识库网页重新授权飞书。'
+WHERE provider='feishu' AND last_error IN (
+    '飞书授权已失效，请重新授权自动同步。',
+    '请在知识库网页重新授权飞书自动同步。'
+);
 CREATE TABLE IF NOT EXISTS managed_availability_event (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     document_id text NOT NULL,

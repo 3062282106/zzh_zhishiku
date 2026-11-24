@@ -80,7 +80,7 @@ def ensure_actor(db, source, expected):
     if source_actor(db, source, lock=True) != expected:
         raise SourceError("来源身份已变更，请重新检查。", 409)
     if expected and not authorization_status(db, expected)["authorized"]:
-        raise SourceError("飞书授权已失效，请重新授权自动同步。", 409)
+        raise SourceError("飞书授权已失效，请重新授权飞书。", 409)
 
 
 def same_source(current, previous):
@@ -98,7 +98,7 @@ def sync_source(db, source_id, hybrid, application_token=credential):
         actor = source_actor(db, checkpoint)
         access = user_token(db, actor) if actor else application_token()
         if not access:
-            raise SourceError("请在知识库网页重新授权飞书自动同步。", 409)
+            raise SourceError("飞书授权已失效，请在知识库网页重新授权飞书。", 409)
         token, revision, title = document_revision(checkpoint["source_url"], access)
         expected_token = checkpoint["feishu_doc_token"]
         if not expected_token and checkpoint["user_imported"] and checkpoint["external_id"].startswith("docx:"):

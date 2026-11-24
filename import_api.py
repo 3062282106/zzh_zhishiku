@@ -34,6 +34,7 @@ from notion_source import SourceError
 Session = Annotated[str, Depends(reader_identity)]
 Admin = Annotated[dict, Depends(admin_identity)]
 FLOW_COOKIE = "kb_feishu_flow"
+OAUTH_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 LINK = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)]
 
 
@@ -250,21 +251,24 @@ def router(hybrid):
         except SourceError as error:
             raise translate(error) from None
 
+    def set_flow_cookie(response, state):
+        response.set_cookie(FLOW_COOKIE, state, secure=True, httponly=True, samesite="lax",
+                            path=CALLBACK, max_age=300)
+
     @routes.post("/v1/knowledge/feishu/authorize")
-    def authorize_feishu(token: Session, response: Response, offline: bool = False):
+    def authorize_feishu(token: Session, response: Response, offline: bool = True):
         try:
             state = token_urlsafe(32)
             with connect() as db:
                 url = begin_oauth(db, token, state, offline=offline)
         except SourceError as error:
             raise translate(error) from None
-        response.headers["Cache-Control"] = "no-store"
-        response.set_cookie(FLOW_COOKIE, state, secure=True, httponly=True, samesite="lax",
-                            path=CALLBACK, max_age=300)
+        response.headers.update(OAUTH_HEADERS)
+        set_flow_cookie(response, state)
         return {"url": url}
 
     @routes.get(CALLBACK, include_in_schema=False)
-    def feishu_callback(request: Request, code: str = "", state: str = ""):
+    def feishu_callback(request: Request, code: str = "", state: str = "", error: str = ""):
         nonce = request.cookies.get(FLOW_COOKIE, "")
         if not (nonce and len(state) == 43 and state.isascii() and compare_digest(nonce.encode(), state.encode())):
             raise HTTPException(400, "飞书授权状态无效，请从知识库网页重新授权。",
@@ -275,6 +279,19 @@ def router(hybrid):
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         result = "cancelled"
         query = {}
+        if pending.offline and not code and error == "invalid_scope":
+            # A tenant may still be waiting for the offline scope to be published.
+            try:
+                next_state = token_urlsafe(32)
+                with connect() as db:
+                    if web_importer(db, pending.web_token) != pending.actor:
+                        raise SourceError("飞书授权身份已变更。", 401)
+                    url = begin_oauth(db, pending.web_token, next_state, offline=False)
+                response = RedirectResponse(url, status_code=303, headers=OAUTH_HEADERS)
+                set_flow_cookie(response, next_state)
+                return response
+            except SourceError as problem:
+                result = "session" if problem.status == 401 else "failed"
         if code and len(code) <= 2048:
             try:
                 with connect() as db:
@@ -289,7 +306,7 @@ def router(hybrid):
                 logging.getLogger(__name__).warning("Feishu OAuth callback failed (status=%s): %s", error.status, error)
         query["feishu"] = result
         response = RedirectResponse(console_path(pending.actor) + "?" + urlencode(query), status_code=303,
-                                    headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+                                    headers=OAUTH_HEADERS)
         response.delete_cookie(FLOW_COOKIE, path=CALLBACK, secure=True, httponly=True, samesite="lax")
         return response
 

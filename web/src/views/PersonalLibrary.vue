@@ -124,12 +124,12 @@ onMounted(async () => {
 });
 onUnmounted(() => clearInterval(timer));
 
-async function authorize(offline = false) {
+async function authorize() {
   if (busy.value) return;
   busy.value = true;
   error.value = "";
   try {
-    const result = await knowledgeApi("/feishu/authorize" + (offline ? "?offline=true" : ""), { method: "POST" });
+    const result = await knowledgeApi("/feishu/authorize", { method: "POST" });
     window.location.assign(result.url);
   } catch (problem) {
     error.value = problem.message;
@@ -202,11 +202,9 @@ async function publish() {
     <header class="personal-head">
       <h1>个人知识库</h1>
       <div v-if="status?.upload_enabled" class="personal-actions">
-        <button class="btn" :disabled="busy" @click="authorize(status.auto_sync_authorized)">
+        <button class="btn" :disabled="busy" @click="authorize">
           {{ status.authorized ? "重新授权飞书" : "授权飞书" }}
         </button>
-        <button v-if="!status.auto_sync_authorized && files.some(file => file.source === 'feishu')"
-                class="btn" :disabled="busy" @click="authorize(true)">授权自动同步</button>
         <button class="btn primary" :disabled="busy" @click="uploadOpen = true">上传文档</button>
       </div>
     </header>

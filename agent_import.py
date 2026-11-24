@@ -194,7 +194,7 @@ def console_origin(redirect):
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def begin_oauth(db, token, state, *, offline=False):
+def begin_oauth(db, token, state, *, offline=True):
     actor = web_importer(db, token)
     if not upload_enabled(db, actor):
         raise SourceError("你的账号尚未开通上传权限。", 403)
@@ -261,7 +261,7 @@ def complete_oauth(db, pending, code):
     save_user_token(db, pending.actor, app, access_token, expires_in - 30,
                     refresh_token=refresh, refresh_lifetime=refresh_lifetime)
     if pending.offline and not refresh:
-        raise OAuthFailure("offline_missing")
+        logging.getLogger(__name__).info("Feishu authorization granted access without a refresh token")
 
 
 def token_cipher():

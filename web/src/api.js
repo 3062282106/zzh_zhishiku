@@ -62,7 +62,6 @@ export function feishuError(status, code) {
     identity: "知识库读取飞书账号信息时失败。",
     session: "知识库登录或上传权限已失效，请重新登录后授权。",
     cancelled: "飞书没有返回授权结果，请重新授权。",
-    offline_missing: "飞书未授予离线访问权限。请确认应用已发布「离线访问已授权数据」权限，再授权自动同步。",
   };
   const message = messages[status] || "飞书授权未完成，请重试。";
   return /^\d{1,12}$/.test(String(code)) ? message + "（飞书错误码 " + code + "）" : message;
